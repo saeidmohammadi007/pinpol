@@ -196,15 +196,15 @@ if results:
     lines = []
     lines.append(f"🏆 <b>کندل‌های ۴ ساعته (قبلی) مشابه کندل روزانه {PATTERN_SYMBOL} ({PATTERN_DATE})</b>\n")
     lines.append(f"الگو (روزانه): O={o:.6g} | H={h:.6g} | L={l:.6g} | C={c:.6g}")
-    lines.append("🔎 <i>فیلتر فعال: MACD > Signal  و  CCI < 30</i>\n")
+    lines.append("🔎 <i>فیلتر فعال: MACD &gt; Signal  و  CCI &lt; 30</i>\n")
     for _, row in df_res.iterrows():
         lines.append(
             f"🔸 <b>{row['symbol']}</b>  (فاصله: {row['dist']:.4f})\n"
             f"   زمان ۴h: {row['last_4h']} | "
             f"O={row['o']:.6g} H={row['h']:.6g} "
             f"L={row['l']:.6g} C={row['c']:.6g}\n"
-            f"   MACD={row['macd']:.4g} > Signal={row['signal']:.4g} | "
-            f"CCI={row['cci']:.2f} (<30 ✅)"
+            f"   MACD={row['macd']:.4g} &gt; Signal={row['signal']:.4g} | "
+            f"CCI={row['cci']:.2f} (&lt;30 ✅)"
         )
     lines.append(f"\n📅 تعداد ارزهای اسکن‌شده: {len(symbols)}")
     message = "\n".join(lines)
