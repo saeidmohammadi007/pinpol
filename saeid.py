@@ -88,6 +88,16 @@ def compute_macd(close_series, fast=12, slow=26, signal=9):
     signal_line = macd_line.ewm(span=signal, adjust=False).mean()
     return macd_line, signal_line
 
+def compute_cci(high, low, close, period=20):
+    """محاسبه‌ی CCI روی سری‌های High/Low/Close"""
+    tp = (high + low + close) / 3.0
+    sma_tp = tp.rolling(window=period).mean()
+    mad = tp.rolling(window=period).apply(
+        lambda x: np.mean(np.abs(x - np.mean(x))), raw=True
+    )
+    cci = (tp - sma_tp) / (0.015 * mad)
+    return cci
+
 def send_telegram_message(text):
     token = os.environ.get('TELEGRAM_BOT_TOKEN')
     chat_id = os.environ.get('TELEGRAM_CHAT_ID')
@@ -139,18 +149,22 @@ results = []
 for sym in tqdm(symbols, desc="اسکن کندل ۴ ساعته (قبلی)"):
     try:
         df_4h = get_4h_data(f"{sym}-USD")
-        if df_4h is None or len(df_4h) < 35:   # حداقل داده برای MACD
+        if df_4h is None or len(df_4h) < 35:   # حداقل داده برای MACD و CCI
             continue
 
-        # ---------- ✅ شرط ۱: خط MACD بالای خط Signal باشد ----------
+        # ---------- ✅ شرط MACD: خط MACD بالای خط Signal باشد ----------
         macd_line, signal_line = compute_macd(df_4h['close'])
         if not (macd_line.iloc[-2] > signal_line.iloc[-2]):
             continue
+        # --------------------------------------------------------------
 
-        # ---------- ✅ شرط ۲: شیب MACD نزولی (از ۲ کندل قبل به ۱ کندل قبل) ----------
-        if not (macd_line.iloc[-2] < macd_line.iloc[-3]):
+        # ---------- ✅ شرط CCI: مقدار CCI زیر 30 باشد ----------
+        cci_series = compute_cci(df_4h['high'], df_4h['low'],
+                                 df_4h['close'], period=20)
+        cci_val = cci_series.iloc[-2]
+        if pd.isna(cci_val) or cci_val >= 30:
             continue
-        # ----------------------------------------------------------------------
+        # -------------------------------------------------------
 
         prev = df_4h.iloc[-2]
         vec = candle_vector(prev['open'], prev['high'],
@@ -161,16 +175,16 @@ for sym in tqdm(symbols, desc="اسکن کندل ۴ ساعته (قبلی)"):
         dist = float(np.linalg.norm(pattern_vec - vec))
 
         results.append({
-            'symbol':    sym,
-            'dist':      dist,
-            'last_4h':   df_4h.index[-2].strftime('%Y-%m-%d %H:%M'),
-            'o':         float(prev['open']),
-            'h':         float(prev['high']),
-            'l':         float(prev['low']),
-            'c':         float(prev['close']),
-            'macd':      float(macd_line.iloc[-2]),
-            'signal':    float(signal_line.iloc[-2]),
-            'macd_prev': float(macd_line.iloc[-3]),
+            'symbol':   sym,
+            'dist':     dist,
+            'last_4h':  df_4h.index[-2].strftime('%Y-%m-%d %H:%M'),
+            'o': float(prev['open']),
+            'h': float(prev['high']),
+            'l': float(prev['low']),
+            'c': float(prev['close']),
+            'macd':   float(macd_line.iloc[-2]),
+            'signal': float(signal_line.iloc[-2]),
+            'cci':    float(cci_val),
         })
         time.sleep(0.3)
     except Exception:
@@ -182,17 +196,15 @@ if results:
     lines = []
     lines.append(f"🏆 <b>کندل‌های ۴ ساعته (قبلی) مشابه کندل روزانه {PATTERN_SYMBOL} ({PATTERN_DATE})</b>\n")
     lines.append(f"الگو (روزانه): O={o:.6g} | H={h:.6g} | L={l:.6g} | C={c:.6g}")
-    lines.append("🔎 <i>فیلتر فعال: MACD > Signal  و  شیب MACD نزولی (۲ کندل قبل → ۱ کندل قبل)</i>\n")
+    lines.append("🔎 <i>فیلتر فعال: MACD > Signal  و  CCI < 30</i>\n")
     for _, row in df_res.iterrows():
-        slope = row['macd'] - row['macd_prev']
-        slope_icon = "🔻" if slope < 0 else "🔺"
         lines.append(
             f"🔸 <b>{row['symbol']}</b>  (فاصله: {row['dist']:.4f})\n"
             f"   زمان ۴h: {row['last_4h']} | "
             f"O={row['o']:.6g} H={row['h']:.6g} "
             f"L={row['l']:.6g} C={row['c']:.6g}\n"
-            f"   MACD={row['macd']:.4g} > Signal={row['signal']:.4g}  "
-            f"| شیب: {slope_icon} {slope:+.4g}"
+            f"   MACD={row['macd']:.4g} > Signal={row['signal']:.4g} | "
+            f"CCI={row['cci']:.2f} (<30 ✅)"
         )
     lines.append(f"\n📅 تعداد ارزهای اسکن‌شده: {len(symbols)}")
     message = "\n".join(lines)
