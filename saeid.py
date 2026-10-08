@@ -142,17 +142,7 @@ for sym in tqdm(symbols, desc="اسکن کندل ۴ ساعته (قبلی)"):
         if df_4h is None or len(df_4h) < 35:   # حداقل داده برای MACD
             continue
 
-        # ---------- ✅ شرط MACD: خط MACD بالای خط Signal باشد ----------
-        macd_line, signal_line = compute_macd(df_4h['close'])
-        if not (macd_line.iloc[-2] > signal_line.iloc[-2]):
-            continue
-        # --------------------------------------------------------------
-
-        # ---------- ✅ شرط جدید: شیب MACD از کندل ۳ قبل به ۲ قبل نزولی باشد ----------
-        # یعنی MACD[-3] > MACD[-2]
-        if not (macd_line.iloc[-3] > macd_line.iloc[-2]):
-            continue
-        # -------------------------------------------------------------------------
+        # (فیلترهای MACD حذف شدند)
 
         prev = df_4h.iloc[-2]
         vec = candle_vector(prev['open'], prev['high'],
@@ -161,6 +151,9 @@ for sym in tqdm(symbols, desc="اسکن کندل ۴ ساعته (قبلی)"):
             continue
 
         dist = float(np.linalg.norm(pattern_vec - vec))
+
+        # MACD صرفاً برای نمایش محاسبه می‌شود (بدون فیلتر)
+        macd_line, signal_line = compute_macd(df_4h['close'])
 
         results.append({
             'symbol':   sym,
@@ -183,14 +176,14 @@ if results:
     lines = []
     lines.append(f"🏆 <b>کندل‌های ۴ ساعته (قبلی) مشابه کندل روزانه {PATTERN_SYMBOL} ({PATTERN_DATE})</b>\n")
     lines.append(f"الگو (روزانه): O={o:.6g} | H={h:.6g} | L={l:.6g} | C={c:.6g}")
-    lines.append("🔎 <i>فیلتر فعال: MACD &gt; Signal و شیب نزولی MACD (۳→۲ کندل قبل)</i>\n")
+    lines.append("🔎 <i>بدون فیلتر MACD (فقط شباهت کندلی)</i>\n")
     for _, row in df_res.iterrows():
         lines.append(
             f"🔸 <b>{row['symbol']}</b>  (فاصله: {row['dist']:.4f})\n"
             f"   زمان ۴h: {row['last_4h']} | "
             f"O={row['o']:.6g} H={row['h']:.6g} "
             f"L={row['l']:.6g} C={row['c']:.6g}\n"
-            f"   MACD={row['macd']:.4g} &gt; Signal={row['signal']:.4g}"
+            f"   MACD={row['macd']:.4g} | Signal={row['signal']:.4g}"
         )
     lines.append(f"\n📅 تعداد ارزهای اسکن‌شده: {len(symbols)}")
     message = "\n".join(lines)
