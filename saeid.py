@@ -9,7 +9,7 @@ import ccxt
 
 # --- الگوی مرجع: تک‌کندل روزانه ETH ---
 PATTERN_SYMBOL = 'ETH-USD'
-PATTERN_DATE   = '2025-07-04'
+PATTERN_DATE   = '2025-08-01'
 SHOW_N         = 10
 
 # ---------- توابع ----------
@@ -48,11 +48,28 @@ def get_daily_data(ticker, start='2024-01-01'):
     df.columns = ['open', 'high', 'low', 'close']
     return df
 
-def get_4h_data(ticker):
-    df = yf.download(ticker, period='60d', interval='1h',
-                     progress=False, auto_adjust=False)
-    if df.empty:
+def get_4h_data(ticker, start_date=None, end_date=None):
+    """
+    اگر start_date داده شود، داده‌ی ساعتی در همان بازه گرفته و به 4h تبدیل می‌شود.
+    در غیر این صورت 60 روز اخیر.
+    """
+    try:
+        if start_date:
+            df = yf.download(ticker,
+                             start=start_date,
+                             end=end_date,
+                             interval='1h',
+                             progress=False,
+                             auto_adjust=False)
+        else:
+            df = yf.download(ticker, period='60d', interval='1h',
+                             progress=False, auto_adjust=False)
+    except Exception:
         return None
+
+    if df is None or df.empty:
+        return None
+
     df = df[['Open', 'High', 'Low', 'Close']].copy()
     df.index = pd.to_datetime(df.index)
     df.columns = ['open', 'high', 'low', 'close']
@@ -79,14 +96,6 @@ def candle_vector(o, h, l, c):
         0.0,
         (float(c) - float(l)) / rng,
     ])
-
-def compute_macd(close_series, fast=12, slow=26, signal=9):
-    """محاسبه‌ی MACD و Signal روی سری Close"""
-    ema_fast = close_series.ewm(span=fast, adjust=False).mean()
-    ema_slow = close_series.ewm(span=slow, adjust=False).mean()
-    macd_line = ema_fast - ema_slow
-    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
-    return macd_line, signal_line
 
 def send_telegram_message(text):
     token = os.environ.get('TELEGRAM_BOT_TOKEN')
@@ -129,6 +138,17 @@ print(f"📌 کندل مرجع (روزانه): O={o:.4f}  H={h:.4f}  L={l:.4f}  
 print(f"📐 بردار الگو: O={pattern_vec[0]:.3f} | H={pattern_vec[1]:.3f} | "
       f"L={pattern_vec[2]:.3f} | C={pattern_vec[3]:.3f}")
 
+# --- بازه‌ی زمانی برای دریافت کندل ۴ ساعته‌ی «قبلی» متناظر با تاریخ الگو ---
+pattern_dt   = pd.to_datetime(PATTERN_DATE)
+scan_end_dt  = pattern_dt
+scan_start_dt = pattern_dt - pd.Timedelta(days=10)
+
+scan_start_str = scan_start_dt.strftime('%Y-%m-%d')
+scan_end_str   = scan_end_dt.strftime('%Y-%m-%d')
+
+print(f"\n🕒 بازه‌ی دریافت کندل ۴ ساعته: {scan_start_str} تا {scan_end_str}")
+print(f"🎯 کندل هدف: آخرین کندل ۴ ساعته‌ی کامل‌شده قبل از {PATTERN_DATE}")
+
 print("\n📊 دریافت نمادهای فیوچرز LBank ...")
 symbols = get_lbank_futures_symbols()
 if not symbols:
@@ -138,13 +158,14 @@ if not symbols:
 results = []
 for sym in tqdm(symbols, desc="اسکن کندل ۴ ساعته (قبلی)"):
     try:
-        df_4h = get_4h_data(f"{sym}-USD")
-        if df_4h is None or len(df_4h) < 35:   # حداقل داده برای MACD
+        df_4h = get_4h_data(f"{sym}-USD",
+                            start_date=scan_start_str,
+                            end_date=scan_end_str)
+        if df_4h is None or len(df_4h) < 5:
             continue
 
-        # (فیلترهای MACD حذف شدند)
+        prev = df_4h.iloc[-1]
 
-        prev = df_4h.iloc[-2]
         vec = candle_vector(prev['open'], prev['high'],
                             prev['low'],  prev['close'])
         if vec is None:
@@ -152,19 +173,14 @@ for sym in tqdm(symbols, desc="اسکن کندل ۴ ساعته (قبلی)"):
 
         dist = float(np.linalg.norm(pattern_vec - vec))
 
-        # MACD صرفاً برای نمایش محاسبه می‌شود (بدون فیلتر)
-        macd_line, signal_line = compute_macd(df_4h['close'])
-
         results.append({
             'symbol':   sym,
             'dist':     dist,
-            'last_4h':  df_4h.index[-2].strftime('%Y-%m-%d %H:%M'),
+            'last_4h':  df_4h.index[-1].strftime('%Y-%m-%d %H:%M'),
             'o': float(prev['open']),
             'h': float(prev['high']),
             'l': float(prev['low']),
             'c': float(prev['close']),
-            'macd':   float(macd_line.iloc[-2]),
-            'signal': float(signal_line.iloc[-2]),
         })
         time.sleep(0.3)
     except Exception:
@@ -174,16 +190,15 @@ if results:
     df_res = pd.DataFrame(results).sort_values('dist').head(SHOW_N)
 
     lines = []
-    lines.append(f"🏆 <b>کندل‌های ۴ ساعته (قبلی) مشابه کندل روزانه {PATTERN_SYMBOL} ({PATTERN_DATE})</b>\n")
+    lines.append(f"🏆 <b>کندل‌های ۴ ساعته‌ی مشابه کندل روزانه {PATTERN_SYMBOL} ({PATTERN_DATE})</b>\n")
     lines.append(f"الگو (روزانه): O={o:.6g} | H={h:.6g} | L={l:.6g} | C={c:.6g}")
-    lines.append("🔎 <i>بدون فیلتر MACD (فقط شباهت کندلی)</i>\n")
+    lines.append(f"🎯 کندل هدف ۴h: منتهی به 20:00 روز قبل از {PATTERN_DATE}\n")
     for _, row in df_res.iterrows():
         lines.append(
             f"🔸 <b>{row['symbol']}</b>  (فاصله: {row['dist']:.4f})\n"
             f"   زمان ۴h: {row['last_4h']} | "
             f"O={row['o']:.6g} H={row['h']:.6g} "
-            f"L={row['l']:.6g} C={row['c']:.6g}\n"
-            f"   MACD={row['macd']:.4g} | Signal={row['signal']:.4g}"
+            f"L={row['l']:.6g} C={row['c']:.6g}"
         )
     lines.append(f"\n📅 تعداد ارزهای اسکن‌شده: {len(symbols)}")
     message = "\n".join(lines)
