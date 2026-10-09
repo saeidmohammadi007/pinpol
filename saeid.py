@@ -9,7 +9,7 @@ import ccxt
 
 # --- الگوی مرجع: تک‌کندل روزانه ETH ---
 PATTERN_SYMBOL = 'ETH-USD'
-PATTERN_DATE   = '2025-08-01'
+PATTERN_DATE   = '2025-07-04'   # ← تغییر یافته
 SHOW_N         = 10
 
 # ---------- توابع ----------
