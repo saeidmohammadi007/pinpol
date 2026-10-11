@@ -6,21 +6,13 @@ import time
 import requests
 from tqdm import tqdm
 
-# ---------- تنظیمات A+ ----------
-TIMEFRAMES      = ['1h', '4h']   # ← هر دو تایم‌فریم اسکن می‌شوند
-EMA_FAST        = 50
-EMA_SLOW        = 200
+# ---------- تنظیمات ----------
+TIMEFRAMES      = ['1h', '4h']
 WICK_RATIO      = 2.5
 BODY_MAX_RATIO  = 0.33
 CLOSE_ZONE      = 0.25
-PULLBACK_TOL    = 0.008
-MIN_BARS        = 220
-EMA_SLOPE_LOOKBACK = 3
-MIN_RR          = 2.0
-MIN_TREND_GAP   = 0.002
-ENABLE_LONG     = True
-ENABLE_SHORT    = True
-LOG_CSV         = "signals_log.csv"
+MIN_BARS        = 100
+LOG_CSV         = "bullish_pinbar_log.csv"
 
 # ---------- اتصال ccxt ----------
 _EXCHANGE = None
@@ -59,7 +51,6 @@ def get_lbank_futures_symbols():
 
 
 def get_data(symbol, timeframe):
-    """دریافت داده خام 1h و ریسمپل به تایم‌فریم مورد نظر"""
     exchange = get_exchange()
     try:
         raw = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=1000)
@@ -87,13 +78,7 @@ def get_data(symbol, timeframe):
     return df_res, None
 
 
-# ---------- اندیکاتورها ----------
-def add_emas(df, fast=EMA_FAST, slow=EMA_SLOW):
-    df['ema_fast'] = df['close'].ewm(span=fast, adjust=False).mean()
-    df['ema_slow'] = df['close'].ewm(span=slow, adjust=False).mean()
-    return df
-
-
+# ---------- تشخیص پین‌بار صعودی ----------
 def is_bull_pin_bar(row):
     o, h, l, c = row['open'], row['high'], row['low'], row['close']
     rng = h - l
@@ -112,104 +97,6 @@ def is_bull_pin_bar(row):
     if (c - l) / rng < (1 - CLOSE_ZONE):
         return False
     return True
-
-
-def is_bear_pin_bar(row):
-    o, h, l, c = row['open'], row['high'], row['low'], row['close']
-    rng = h - l
-    if rng <= 0:
-        return False
-    body = abs(c - o)
-    upper_wick = h - max(o, c)
-    lower_wick = min(o, c) - l
-
-    if body / rng > BODY_MAX_RATIO:
-        return False
-    if upper_wick < WICK_RATIO * max(body, rng * 0.01):
-        return False
-    if upper_wick < WICK_RATIO * lower_wick:
-        return False
-    if (h - c) / rng < (1 - CLOSE_ZONE):
-        return False
-    return True
-
-
-def near_ema50(row, tol=PULLBACK_TOL):
-    ema = row['ema_fast']
-    if ema <= 0 or not np.isfinite(ema):
-        return False
-    return abs(row['low'] - ema) / ema <= tol
-
-
-def near_ema50_short(row, tol=PULLBACK_TOL):
-    ema = row['ema_fast']
-    if ema <= 0 or not np.isfinite(ema):
-        return False
-    return abs(row['high'] - ema) / ema <= tol
-
-
-def is_uptrend(row):
-    if not (np.isfinite(row['ema_fast']) and np.isfinite(row['ema_slow'])):
-        return False
-    if row['ema_fast'] <= row['ema_slow']:
-        return False
-    if row['close'] <= row['ema_slow']:
-        return False
-    if (row['ema_fast'] - row['ema_slow']) / row['ema_slow'] < MIN_TREND_GAP:
-        return False
-    return True
-
-
-def is_downtrend(row):
-    if not (np.isfinite(row['ema_fast']) and np.isfinite(row['ema_slow'])):
-        return False
-    if row['ema_fast'] >= row['ema_slow']:
-        return False
-    if row['close'] >= row['ema_slow']:
-        return False
-    if (row['ema_slow'] - row['ema_fast']) / row['ema_slow'] < MIN_TREND_GAP:
-        return False
-    return True
-
-
-def ema50_rising(df, lookback=EMA_SLOPE_LOOKBACK):
-    if len(df) < lookback + 2:
-        return False
-    now_val  = df['ema_fast'].iloc[-2]
-    prev_val = df['ema_fast'].iloc[-2 - lookback]
-    if not (np.isfinite(now_val) and np.isfinite(prev_val)):
-        return False
-    return now_val > prev_val
-
-
-def ema50_falling(df, lookback=EMA_SLOPE_LOOKBACK):
-    if len(df) < lookback + 2:
-        return False
-    now_val  = df['ema_fast'].iloc[-2]
-    prev_val = df['ema_fast'].iloc[-2 - lookback]
-    if not (np.isfinite(now_val) and np.isfinite(prev_val)):
-        return False
-    return now_val < prev_val
-
-
-def has_pullback_before_long(df, lookback=10):
-    if len(df) < lookback + 3:
-        return False
-    seg = df.iloc[-3 - lookback:-2]
-    if seg.empty:
-        return False
-    touched = ((seg['low'] - seg['ema_fast']).abs() / seg['ema_fast'] < 0.015).any()
-    return bool(touched)
-
-
-def has_pullback_before_short(df, lookback=10):
-    if len(df) < lookback + 3:
-        return False
-    seg = df.iloc[-3 - lookback:-2]
-    if seg.empty:
-        return False
-    touched = ((seg['high'] - seg['ema_fast']).abs() / seg['ema_fast'] < 0.015).any()
-    return bool(touched)
 
 
 # ---------- تلگرام ----------
@@ -231,9 +118,8 @@ def send_telegram_message(text):
         print(f"❌ خطا در ارسال به تلگرام: {e}")
 
 
-# ---------- اسکن یک نماد در یک تایم‌فریم ----------
+# ---------- اسکن یک نماد ----------
 def scan_symbol(sym, tf, stats):
-    """برمی‌گرداند لیست سیگنال‌های یافت‌شده برای این نماد در این تایم‌فریم"""
     found = []
     df, err = get_data(sym, tf)
     if df is None:
@@ -247,81 +133,20 @@ def scan_symbol(sym, tf, stats):
         stats['not_enough_bars'] += 1
         return found
 
-    df = add_emas(df)
     row = df.iloc[-2]
     row_time = df.index[-2]
 
-    # ---- Long ----
-    if ENABLE_LONG:
-        if is_uptrend(row):
-            if ema50_rising(df):
-                if near_ema50(row):
-                    if is_bull_pin_bar(row):
-                        if has_pullback_before_long(df):
-                            entry = float(row['high'])
-                            stop  = float(row['low'])
-                            risk  = entry - stop
-                            if risk > 0:
-                                tp1 = entry + risk * 1.0
-                                tp2 = entry + risk * 2.0
-                                rr = (tp2 - entry) / risk
-                                if rr >= MIN_RR:
-                                    found.append({
-                                        'symbol': sym, 'side': 'LONG',
-                                        'timeframe': tf,
-                                        'time': row_time.strftime('%Y-%m-%d %H:%M'),
-                                        'o': float(row['open']),
-                                        'h': float(row['high']),
-                                        'l': float(row['low']),
-                                        'c': float(row['close']),
-                                        'ema50': float(row['ema_fast']),
-                                        'ema200': float(row['ema_slow']),
-                                        'entry': entry, 'stop': stop,
-                                        'tp1': tp1, 'tp2': tp2,
-                                    })
-                                    stats['passed'] += 1
-                                else:
-                                    stats['rr'] += 1
-                        else:
-                            stats['prev_pullback'] += 1
-                    else:
-                        stats['pinbar'] += 1
-                else:
-                    stats['pullback'] += 1
-            else:
-                stats['slope'] += 1
-        else:
-            stats['trend'] += 1
-
-    # ---- Short ----
-    if ENABLE_SHORT:
-        if is_downtrend(row):
-            if ema50_falling(df):
-                if near_ema50_short(row):
-                    if is_bear_pin_bar(row):
-                        if has_pullback_before_short(df):
-                            entry = float(row['low'])
-                            stop  = float(row['high'])
-                            risk  = stop - entry
-                            if risk > 0:
-                                tp1 = entry - risk * 1.0
-                                tp2 = entry - risk * 2.0
-                                rr = (entry - tp2) / risk
-                                if rr >= MIN_RR:
-                                    found.append({
-                                        'symbol': sym, 'side': 'SHORT',
-                                        'timeframe': tf,
-                                        'time': row_time.strftime('%Y-%m-%d %H:%M'),
-                                        'o': float(row['open']),
-                                        'h': float(row['high']),
-                                        'l': float(row['low']),
-                                        'c': float(row['close']),
-                                        'ema50': float(row['ema_fast']),
-                                        'ema200': float(row['ema_slow']),
-                                        'entry': entry, 'stop': stop,
-                                        'tp1': tp1, 'tp2': tp2,
-                                    })
-                                    stats['passed'] += 1
+    if is_bull_pin_bar(row):
+        found.append({
+            'symbol': sym,
+            'timeframe': tf,
+            'time': row_time.strftime('%Y-%m-%d %H:%M'),
+            'o': float(row['open']),
+            'h': float(row['high']),
+            'l': float(row['low']),
+            'c': float(row['close']),
+        })
+        stats['passed'] += 1
 
     return found
 
@@ -329,8 +154,7 @@ def scan_symbol(sym, tf, stats):
 # ---------- اجرای اصلی ----------
 now_utc = pd.Timestamp.utcnow().tz_localize(None)
 print(f"🕒 زمان فعلی UTC: {now_utc.strftime('%Y-%m-%d %H:%M')}")
-print(f"⭐ اسکن A+ روی تایم‌فریم‌های: {', '.join(TIMEFRAMES)}")
-print(f"   Long={ENABLE_LONG} Short={ENABLE_SHORT}")
+print(f"⭐ اسکن پین‌بار صعودی روی: {', '.join(TIMEFRAMES)}")
 
 print("\n📊 دریافت نمادهای فیوچرز LBank ...")
 symbols = get_lbank_futures_symbols()
@@ -343,16 +167,10 @@ stats = {
     'total':            len(symbols),
     'data_error':       0,
     'not_enough_bars':  0,
-    'trend':            0,
-    'slope':            0,
-    'pullback':         0,
-    'pinbar':           0,
-    'prev_pullback':    0,
-    'rr':               0,
     'passed':           0,
 }
 
-for sym in tqdm(symbols, desc="اسکن A+"):
+for sym in tqdm(symbols, desc="اسکن پین‌بار صعودی"):
     for tf in TIMEFRAMES:
         try:
             found = scan_symbol(sym, tf, stats)
@@ -378,12 +196,10 @@ if signals:
 # ---------- ارسال به تلگرام ----------
 if signals:
     lines = []
-    lines.append(f"⭐ <b>ستاپ‌های A+ — پین‌بار در پولبک EMA{EMA_FAST}</b>")
+    lines.append("⭐ <b>پین‌بار صعودی</b>")
     lines.append(f"⏱ تایم‌فریم‌ها: {' + '.join(TIMEFRAMES)}")
-    lines.append(f"⚙️ سایه≥{WICK_RATIO}x | بدنه≤{BODY_MAX_RATIO} | "
-                 f"پولبک≤{PULLBACK_TOL*100}%\n")
+    lines.append(f"⚙️ سایه≥{WICK_RATIO}x | بدنه≤{BODY_MAX_RATIO}\n")
 
-    # مرتب‌سازی: ابتدا 1h، سپس 4h (یا هر ترتیب TIMEFRAMES)
     for tf in TIMEFRAMES:
         tf_signals = [s for s in signals if s['timeframe'] == tf]
         if not tf_signals:
@@ -391,19 +207,12 @@ if signals:
 
         lines.append(f"\n🔹 <b>تایم‌فریم {tf}</b> ({len(tf_signals)} سیگنال)")
         for s in tf_signals:
-            icon = "🟢" if s['side'] == 'LONG' else "🔴"
             lines.append(
                 f"━━━━━━━━━━━━━━━\n"
-                f"🌟 <b>{s['symbol']}</b> — {icon} {s['side']} "
-                f"[<b>{s['timeframe']}</b>]\n"
+                f"🌟 <b>{s['symbol']}</b> [<b>{s['timeframe']}</b>]\n"
                 f"🕒 کندل: {s['time']}\n"
-                f"📊 OHLC: O={s['o']:.6g} H={s['h']:.6g} "
-                f"L={s['l']:.6g} C={s['c']:.6g}\n"
-                f"📈 EMA50={s['ema50']:.6g} | EMA200={s['ema200']:.6g}\n"
-                f"🎯 ورود: {s['entry']:.6g}\n"
-                f"🛑 استاپ: {s['stop']:.6g}\n"
-                f"✅ TP1 (1R): {s['tp1']:.6g}\n"
-                f"✅ TP2 (2R): {s['tp2']:.6g}"
+                f"📊 O={s['o']:.6g} H={s['h']:.6g} "
+                f"L={s['l']:.6g} C={s['c']:.6g}"
             )
 
     lines.append(f"\n📅 اسکن‌شده: {stats['total']} نماد × {len(TIMEFRAMES)} تایم‌فریم")
@@ -415,17 +224,11 @@ if signals:
     print("\n" + message)
 else:
     msg = (
-        f"⭐ اسکن A+ انجام شد — هیچ ستاپی یافت نشد.\n"
-        f"📊 آمار فیلترها:\n"
+        f"⭐ اسکن پین‌بار صعودی انجام شد — چیزی یافت نشد.\n"
+        f"📊 آمار:\n"
         f"  • کل نمادها: {stats['total']} × {len(TIMEFRAMES)} تایم‌فریم\n"
         f"  • خطای داده: {stats['data_error']}\n"
         f"  • کندل ناکافی: {stats['not_enough_bars']}\n"
-        f"  • روند نامناسب: {stats['trend']}\n"
-        f"  • شیب EMA50: {stats['slope']}\n"
-        f"  • پولبک به EMA50: {stats['pullback']}\n"
-        f"  • پین‌بار ضعیف: {stats['pinbar']}\n"
-        f"  • اصلاح قبل پین‌بار: {stats['prev_pullback']}\n"
-        f"  • RR ناکافی: {stats['rr']}\n"
         f"🕒 {now_utc.strftime('%Y-%m-%d %H:%M')} UTC"
     )
     send_telegram_message(msg)
