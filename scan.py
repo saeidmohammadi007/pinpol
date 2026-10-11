@@ -7,11 +7,12 @@ import requests
 from tqdm import tqdm
 
 # ---------- تنظیمات ----------
-TIMEFRAMES      = ['1h', '4h']
-WICK_RATIO      = 2.5
-BODY_MAX_RATIO  = 0.33
-CLOSE_ZONE      = 0.25
-MIN_BARS        = 100
+TIMEFRAMES      = ['1d']     # ← فقط روزانه
+MIN_BARS        = 30         # ← چون فقط روزانه لازم داریم (1000 ساعت ≈ 41 روز)
+MIN_SIMILARITY  = 75.0       # ← حداقل درصد شباهت به پین‌بار ایده‌آل
+
+IDEAL_VECTOR    = np.array([0.0, 0.0, 1.0])
+MAX_DIST        = np.sqrt(2.0)
 
 # ---------- اتصال ccxt ----------
 _EXCHANGE = None
@@ -77,25 +78,27 @@ def get_data(symbol, timeframe):
     return df_res, None
 
 
-# ---------- تشخیص پین‌بار صعودی ----------
-def is_bull_pin_bar(row):
+# ---------- محاسبه شباهت پین‌بار با فاصله اقلیدسی ----------
+def pin_bar_similarity(row):
     o, h, l, c = row['open'], row['high'], row['low'], row['close']
     rng = h - l
     if rng <= 0:
-        return False
-    body = abs(c - o)
-    upper_wick = h - max(o, c)
-    lower_wick = min(o, c) - l
+        return None
 
-    if body / rng > BODY_MAX_RATIO:
-        return False
-    if lower_wick < WICK_RATIO * max(body, rng * 0.01):
-        return False
-    if lower_wick < WICK_RATIO * upper_wick:
-        return False
-    if (c - l) / rng < (1 - CLOSE_ZONE):
-        return False
-    return True
+    body        = abs(c - o)
+    upper_wick  = h - max(o, c)
+    lower_wick  = min(o, c) - l
+
+    v = np.array([body / rng, upper_wick / rng, lower_wick / rng])
+    dist = float(np.linalg.norm(v - IDEAL_VECTOR))
+    similarity = (1.0 - dist / MAX_DIST) * 100.0
+
+    return {
+        'similarity': similarity,
+        'body_pct':   body / rng * 100.0,
+        'uw_pct':     upper_wick / rng * 100.0,
+        'lw_pct':     lower_wick / rng * 100.0,
+    }
 
 
 # ---------- تلگرام ----------
@@ -135,15 +138,24 @@ def scan_symbol(sym, tf, stats):
     row = df.iloc[-2]
     row_time = df.index[-2]
 
-    if is_bull_pin_bar(row):
+    result = pin_bar_similarity(row)
+    if result is None:
+        stats['not_enough_bars'] += 1
+        return found
+
+    if result['similarity'] >= MIN_SIMILARITY:
         found.append({
-            'symbol': sym,
-            'timeframe': tf,
-            'time': row_time.strftime('%Y-%m-%d %H:%M'),
+            'symbol':     sym,
+            'timeframe':  tf,
+            'time':       row_time.strftime('%Y-%m-%d %H:%M'),
             'o': float(row['open']),
             'h': float(row['high']),
             'l': float(row['low']),
             'c': float(row['close']),
+            'sim':        result['similarity'],
+            'body_pct':   result['body_pct'],
+            'uw_pct':     result['uw_pct'],
+            'lw_pct':     result['lw_pct'],
         })
         stats['passed'] += 1
 
@@ -153,7 +165,8 @@ def scan_symbol(sym, tf, stats):
 # ---------- اجرای اصلی ----------
 now_utc = pd.Timestamp.utcnow().tz_localize(None)
 print(f"🕒 زمان فعلی UTC: {now_utc.strftime('%Y-%m-%d %H:%M')}")
-print(f"⭐ اسکن پین‌بار صعودی روی: {', '.join(TIMEFRAMES)}")
+print(f"⭐ اسکن پین‌بار صعودی روزانه (فاصله اقلیدسی)")
+print(f"🎯 حداقل شباهت: {MIN_SIMILARITY}%")
 
 print("\n📊 دریافت نمادهای فیوچرز LBank ...")
 symbols = get_lbank_futures_symbols()
@@ -169,7 +182,7 @@ stats = {
     'passed':           0,
 }
 
-for sym in tqdm(symbols, desc="اسکن پین‌بار صعودی"):
+for sym in tqdm(symbols, desc="اسکن پین‌بار روزانه"):
     for tf in TIMEFRAMES:
         try:
             found = scan_symbol(sym, tf, stats)
@@ -182,27 +195,26 @@ for sym in tqdm(symbols, desc="اسکن پین‌بار صعودی"):
 
 # ---------- ساخت متن و ارسال به تلگرام ----------
 if signals:
+    signals.sort(key=lambda s: s['sim'], reverse=True)
+
     lines = []
-    lines.append("⭐ <b>پین‌بار صعودی</b>")
-    lines.append(f"⏱ تایم‌فریم‌ها: {' + '.join(TIMEFRAMES)}")
-    lines.append(f"⚙️ سایه≥{WICK_RATIO}x | بدنه≤{BODY_MAX_RATIO}\n")
+    lines.append("⭐ <b>پین‌بار صعودی روزانه (فاصله اقلیدسی)</b>")
+    lines.append(f"🎯 حداقل شباهت: {MIN_SIMILARITY}%\n")
 
-    for tf in TIMEFRAMES:
-        tf_signals = [s for s in signals if s['timeframe'] == tf]
-        if not tf_signals:
-            continue
+    for s in signals:
+        lines.append(
+            f"━━━━━━━━━━━━━━━\n"
+            f"🌟 <b>{s['symbol']}</b> [<b>{s['timeframe']}</b>]\n"
+            f"🕒 کندل: {s['time']}\n"
+            f"📊 O={s['o']:.6g} H={s['h']:.6g} "
+            f"L={s['l']:.6g} C={s['c']:.6g}\n"
+            f"🎯 شباهت: <b>{s['sim']:.1f}%</b>\n"
+            f"   بدنه={s['body_pct']:.1f}% | "
+            f"سایه بالا={s['uw_pct']:.1f}% | "
+            f"سایه پایین={s['lw_pct']:.1f}%"
+        )
 
-        lines.append(f"\n🔹 <b>تایم‌فریم {tf}</b> ({len(tf_signals)} سیگنال)")
-        for s in tf_signals:
-            lines.append(
-                f"━━━━━━━━━━━━━━━\n"
-                f"🌟 <b>{s['symbol']}</b> [<b>{s['timeframe']}</b>]\n"
-                f"🕒 کندل: {s['time']}\n"
-                f"📊 O={s['o']:.6g} H={s['h']:.6g} "
-                f"L={s['l']:.6g} C={s['c']:.6g}"
-            )
-
-    lines.append(f"\n📅 اسکن‌شده: {stats['total']} نماد × {len(TIMEFRAMES)} تایم‌فریم")
+    lines.append(f"\n📅 اسکن‌شده: {stats['total']} نماد")
     lines.append(f"⭐ سیگنال‌ها: {len(signals)}")
     lines.append(f"🕒 {now_utc.strftime('%Y-%m-%d %H:%M')} UTC")
 
@@ -211,9 +223,9 @@ if signals:
     print("\n" + message)
 else:
     msg = (
-        f"⭐ اسکن پین‌بار صعودی انجام شد — چیزی یافت نشد.\n"
+        f"⭐ اسکن پین‌بار صعودی روزانه انجام شد — چیزی یافت نشد.\n"
         f"📊 آمار:\n"
-        f"  • کل نمادها: {stats['total']} × {len(TIMEFRAMES)} تایم‌فریم\n"
+        f"  • کل نمادها: {stats['total']}\n"
         f"  • خطای داده: {stats['data_error']}\n"
         f"  • کندل ناکافی: {stats['not_enough_bars']}\n"
         f"🕒 {now_utc.strftime('%Y-%m-%d %H:%M')} UTC"
