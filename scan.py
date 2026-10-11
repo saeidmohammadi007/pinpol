@@ -12,7 +12,6 @@ WICK_RATIO      = 2.5
 BODY_MAX_RATIO  = 0.33
 CLOSE_ZONE      = 0.25
 MIN_BARS        = 100
-LOG_CSV         = "bullish_pinbar_log.csv"
 
 # ---------- اتصال ccxt ----------
 _EXCHANGE = None
@@ -181,19 +180,7 @@ for sym in tqdm(symbols, desc="اسکن پین‌بار صعودی"):
             continue
         time.sleep(0.15)
 
-# ---------- ذخیره CSV ----------
-if signals:
-    try:
-        df_log = pd.DataFrame(signals)
-        if os.path.exists(LOG_CSV):
-            df_log.to_csv(LOG_CSV, mode='a', header=False, index=False)
-        else:
-            df_log.to_csv(LOG_CSV, index=False)
-        print(f"💾 {len(signals)} سیگنال در {LOG_CSV} ذخیره شد.")
-    except Exception as e:
-        print(f"⚠️ خطا در ذخیره CSV: {e}")
-
-# ---------- ارسال به تلگرام ----------
+# ---------- ساخت متن و ارسال به تلگرام ----------
 if signals:
     lines = []
     lines.append("⭐ <b>پین‌بار صعودی</b>")
