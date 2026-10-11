@@ -1,78 +1,89 @@
 import os
 import pandas as pd
 import numpy as np
-import yfinance as yf
-from tqdm import tqdm
+import ccxt
 import time
 import requests
-import ccxt
+from tqdm import tqdm
 
 # ---------- تنظیمات A+ ----------
 TIMEFRAME       = '4h'
 EMA_FAST        = 50
 EMA_SLOW        = 200
-WICK_RATIO      = 3.0
-BODY_MAX_RATIO  = 0.25
+WICK_RATIO      = 2.5
+BODY_MAX_RATIO  = 0.33
 CLOSE_ZONE      = 0.25
-PULLBACK_TOL    = 0.005
+PULLBACK_TOL    = 0.008
 MIN_BARS        = 220
 EMA_SLOPE_LOOKBACK = 3
 MIN_RR          = 2.0
+MIN_TREND_GAP   = 0.002
+ENABLE_LONG     = True
+ENABLE_SHORT    = True
+LOG_CSV         = "signals_log.csv"
 
-# ---------- توابع ----------
+# ---------- اتصال ccxt ----------
+_EXCHANGE = None
+
+def get_exchange():
+    global _EXCHANGE
+    if _EXCHANGE is None:
+        _EXCHANGE = ccxt.lbank({
+            'options': {'defaultType': 'future'},
+            'enableRateLimit': True,
+        })
+    return _EXCHANGE
+
+
 def get_lbank_futures_symbols():
-    exchange = ccxt.lbank({'options': {'defaultType': 'future'}})
+    exchange = get_exchange()
     try:
         markets = exchange.load_markets()
     except Exception as e:
         print(f"❌ خطا در اتصال به LBank: {e}")
         return []
 
-    base_list = []
+    symbols = []
     for symbol, market in markets.items():
         if not market.get('swap'):
+            continue
+        if market.get('quote') != 'USDT':
             continue
         base = market.get('base')
         if not base or base.isdigit():
             continue
-        base_list.append(base.upper())
+        symbols.append(symbol)
 
-    seen, unique_bases = set(), []
-    for b in base_list:
-        if b not in seen:
-            seen.add(b)
-            unique_bases.append(b)
-    print(f"✅ تعداد ارزهای پایه‌ی منحصربه‌فرد فیوچرز LBank: {len(unique_bases)}")
-    return unique_bases
+    print(f"✅ تعداد نمادهای فیوچرز LBank: {len(symbols)}")
+    return symbols
 
 
-def get_data(ticker):
+def get_data(symbol):
+    exchange = get_exchange()
     try:
-        df = yf.download(ticker, period='60d', interval='1h',
-                         progress=False, auto_adjust=False)
-    except Exception:
-        return None
+        raw = exchange.fetch_ohlcv(symbol, timeframe='1h', limit=1000)
+    except Exception as e:
+        return None, str(e)
 
-    if df is None or df.empty:
-        return None
+    if not raw or len(raw) < MIN_BARS:
+        return None, "not_enough_bars"
 
-    df = df[['Open', 'High', 'Low', 'Close']].copy()
-    df.index = pd.to_datetime(df.index)
-    df.columns = ['open', 'high', 'low', 'close']
-
-    if df.index.tz is not None:
-        df.index = df.index.tz_localize(None)
+    df = pd.DataFrame(raw, columns=['ts', 'open', 'high', 'low', 'close', 'vol'])
+    df['ts'] = pd.to_datetime(df['ts'], unit='ms', utc=True)
+    df = df.set_index('ts')[['open', 'high', 'low', 'close']]
+    df = df.astype(float)
 
     df_res = df.resample('4h').agg({
-        'open':   'first',
-        'high':   'max',
-        'low':    'min',
-        'close':  'last',
+        'open':  'first',
+        'high':  'max',
+        'low':   'min',
+        'close': 'last',
     }).dropna()
 
-    return df_res
+    return df_res, None
 
 
+# ---------- اندیکاتورها ----------
 def add_emas(df, fast=EMA_FAST, slow=EMA_SLOW):
     df['ema_fast'] = df['close'].ewm(span=fast, adjust=False).mean()
     df['ema_slow'] = df['close'].ewm(span=slow, adjust=False).mean()
@@ -84,20 +95,38 @@ def is_bull_pin_bar(row):
     rng = h - l
     if rng <= 0:
         return False
-
     body = abs(c - o)
     upper_wick = h - max(o, c)
     lower_wick = min(o, c) - l
 
     if body / rng > BODY_MAX_RATIO:
         return False
-    if lower_wick < WICK_RATIO * body:
+    if lower_wick < WICK_RATIO * max(body, rng * 0.01):
         return False
     if lower_wick < WICK_RATIO * upper_wick:
         return False
     if (c - l) / rng < (1 - CLOSE_ZONE):
         return False
+    return True
 
+
+def is_bear_pin_bar(row):
+    o, h, l, c = row['open'], row['high'], row['low'], row['close']
+    rng = h - l
+    if rng <= 0:
+        return False
+    body = abs(c - o)
+    upper_wick = h - max(o, c)
+    lower_wick = min(o, c) - l
+
+    if body / rng > BODY_MAX_RATIO:
+        return False
+    if upper_wick < WICK_RATIO * max(body, rng * 0.01):
+        return False
+    if upper_wick < WICK_RATIO * lower_wick:
+        return False
+    if (h - c) / rng < (1 - CLOSE_ZONE):
+        return False
     return True
 
 
@@ -108,6 +137,13 @@ def near_ema50(row, tol=PULLBACK_TOL):
     return abs(row['low'] - ema) / ema <= tol
 
 
+def near_ema50_short(row, tol=PULLBACK_TOL):
+    ema = row['ema_fast']
+    if ema <= 0 or not np.isfinite(ema):
+        return False
+    return abs(row['high'] - ema) / ema <= tol
+
+
 def is_uptrend(row):
     if not (np.isfinite(row['ema_fast']) and np.isfinite(row['ema_slow'])):
         return False
@@ -115,7 +151,19 @@ def is_uptrend(row):
         return False
     if row['close'] <= row['ema_slow']:
         return False
-    if (row['ema_fast'] - row['ema_slow']) / row['ema_slow'] < 0.005:
+    if (row['ema_fast'] - row['ema_slow']) / row['ema_slow'] < MIN_TREND_GAP:
+        return False
+    return True
+
+
+def is_downtrend(row):
+    if not (np.isfinite(row['ema_fast']) and np.isfinite(row['ema_slow'])):
+        return False
+    if row['ema_fast'] >= row['ema_slow']:
+        return False
+    if row['close'] >= row['ema_slow']:
+        return False
+    if (row['ema_slow'] - row['ema_fast']) / row['ema_slow'] < MIN_TREND_GAP:
         return False
     return True
 
@@ -130,14 +178,37 @@ def ema50_rising(df, lookback=EMA_SLOPE_LOOKBACK):
     return now_val > prev_val
 
 
-def has_pullback_before(df, lookback=5):
+def ema50_falling(df, lookback=EMA_SLOPE_LOOKBACK):
+    if len(df) < lookback + 2:
+        return False
+    now_val  = df['ema_fast'].iloc[-2]
+    prev_val = df['ema_fast'].iloc[-2 - lookback]
+    if not (np.isfinite(now_val) and np.isfinite(prev_val)):
+        return False
+    return now_val < prev_val
+
+
+def has_pullback_before_long(df, lookback=10):
     if len(df) < lookback + 3:
         return False
-    before = df.iloc[-4:-2]
-    down_count = sum(1 for _, r in before.iterrows() if r['close'] < r['open'])
-    return down_count >= 1
+    seg = df.iloc[-3 - lookback:-2]
+    if seg.empty:
+        return False
+    touched = ((seg['low'] - seg['ema_fast']).abs() / seg['ema_fast'] < 0.015).any()
+    return bool(touched)
 
 
+def has_pullback_before_short(df, lookback=10):
+    if len(df) < lookback + 3:
+        return False
+    seg = df.iloc[-3 - lookback:-2]
+    if seg.empty:
+        return False
+    touched = ((seg['high'] - seg['ema_fast']).abs() / seg['ema_fast'] < 0.015).any()
+    return bool(touched)
+
+
+# ---------- تلگرام ----------
 def send_telegram_message(text):
     token = os.environ.get('TELEGRAM_BOT_TOKEN')
     chat_id = os.environ.get('TELEGRAM_CHAT_ID')
@@ -147,11 +218,11 @@ def send_telegram_message(text):
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     payload = {'chat_id': chat_id, 'text': text, 'parse_mode': 'HTML'}
     try:
-        r = requests.post(url, data=payload, timeout=10)
+        r = requests.post(url, data=payload, timeout=15)
         if r.status_code != 200:
             print(f"⚠️ خطا در ارسال پیام: {r.text}")
         else:
-            print("✅ پیام با موفقیت به تلگرام ارسال شد.")
+            print("✅ پیام به تلگرام ارسال شد.")
     except Exception as e:
         print(f"❌ خطا در ارسال به تلگرام: {e}")
 
@@ -159,7 +230,7 @@ def send_telegram_message(text):
 # ---------- اجرای اصلی ----------
 now_utc = pd.Timestamp.utcnow().tz_localize(None)
 print(f"🕒 زمان فعلی UTC: {now_utc.strftime('%Y-%m-%d %H:%M')}")
-print(f"⭐ اسکن ستاپ‌های A+ (پین بار صعودی سخت‌گیرانه در پولبک EMA{EMA_FAST})")
+print(f"⭐ اسکن A+ | Long={ENABLE_LONG} Short={ENABLE_SHORT}")
 
 print("\n📊 دریافت نمادهای فیوچرز LBank ...")
 symbols = get_lbank_futures_symbols()
@@ -168,90 +239,137 @@ if not symbols:
     exit()
 
 signals = []
-rejected_stats = {
-    'trend': 0,
-    'slope': 0,
-    'pullback': 0,
-    'pinbar': 0,
-    'prev_pullback': 0,
-    'rr': 0,
+stats = {
+    'total':            len(symbols),
+    'data_error':       0,
+    'not_enough_bars':  0,
+    'trend':            0,
+    'slope':            0,
+    'pullback':         0,
+    'pinbar':           0,
+    'prev_pullback':    0,
+    'rr':               0,
+    'passed':           0,
 }
 
 for sym in tqdm(symbols, desc="اسکن A+"):
     try:
-        df = get_data(f"{sym}-USD")
-        if df is None or len(df) < MIN_BARS:
+        df, err = get_data(sym)
+        if df is None:
+            if err == "not_enough_bars":
+                stats['not_enough_bars'] += 1
+            else:
+                stats['data_error'] += 1
+            continue
+
+        if len(df) < MIN_BARS:
+            stats['not_enough_bars'] += 1
             continue
 
         df = add_emas(df)
         row = df.iloc[-2]
         row_time = df.index[-2]
 
-        if not is_uptrend(row):
-            rejected_stats['trend'] += 1
-            continue
+        # ---- Long ----
+        if ENABLE_LONG:
+            if is_uptrend(row):
+                if ema50_rising(df):
+                    if near_ema50(row):
+                        if is_bull_pin_bar(row):
+                            if has_pullback_before_long(df):
+                                entry = float(row['high'])
+                                stop  = float(row['low'])
+                                risk  = entry - stop
+                                if risk > 0:
+                                    tp1 = entry + risk * 1.0
+                                    tp2 = entry + risk * 2.0
+                                    rr = (tp2 - entry) / risk
+                                    if rr >= MIN_RR:
+                                        signals.append({
+                                            'symbol': sym, 'side': 'LONG',
+                                            'time': row_time.strftime('%Y-%m-%d %H:%M'),
+                                            'o': float(row['open']),
+                                            'h': float(row['high']),
+                                            'l': float(row['low']),
+                                            'c': float(row['close']),
+                                            'ema50': float(row['ema_fast']),
+                                            'ema200': float(row['ema_slow']),
+                                            'entry': entry, 'stop': stop,
+                                            'tp1': tp1, 'tp2': tp2,
+                                        })
+                                        stats['passed'] += 1
+                                    else:
+                                        stats['rr'] += 1
+                            else:
+                                stats['prev_pullback'] += 1
+                        else:
+                            stats['pinbar'] += 1
+                    else:
+                        stats['pullback'] += 1
+                else:
+                    stats['slope'] += 1
+            else:
+                stats['trend'] += 1
 
-        if not ema50_rising(df):
-            rejected_stats['slope'] += 1
-            continue
+        # ---- Short ----
+        if ENABLE_SHORT:
+            if is_downtrend(row):
+                if ema50_falling(df):
+                    if near_ema50_short(row):
+                        if is_bear_pin_bar(row):
+                            if has_pullback_before_short(df):
+                                entry = float(row['low'])
+                                stop  = float(row['high'])
+                                risk  = stop - entry
+                                if risk > 0:
+                                    tp1 = entry - risk * 1.0
+                                    tp2 = entry - risk * 2.0
+                                    rr = (entry - tp2) / risk
+                                    if rr >= MIN_RR:
+                                        signals.append({
+                                            'symbol': sym, 'side': 'SHORT',
+                                            'time': row_time.strftime('%Y-%m-%d %H:%M'),
+                                            'o': float(row['open']),
+                                            'h': float(row['high']),
+                                            'l': float(row['low']),
+                                            'c': float(row['close']),
+                                            'ema50': float(row['ema_fast']),
+                                            'ema200': float(row['ema_slow']),
+                                            'entry': entry, 'stop': stop,
+                                            'tp1': tp1, 'tp2': tp2,
+                                        })
+                                        stats['passed'] += 1
 
-        if not near_ema50(row):
-            rejected_stats['pullback'] += 1
-            continue
-
-        if not is_bull_pin_bar(row):
-            rejected_stats['pinbar'] += 1
-            continue
-
-        if not has_pullback_before(df):
-            rejected_stats['prev_pullback'] += 1
-            continue
-
-        entry = row['high']
-        stop  = row['low']
-        risk  = entry - stop
-        if risk <= 0:
-            continue
-
-        tp1 = entry + risk * 1.0
-        tp2 = entry + risk * 2.0
-
-        rr = (tp2 - entry) / risk
-        if rr < MIN_RR:
-            rejected_stats['rr'] += 1
-            continue
-
-        signals.append({
-            'symbol': sym,
-            'time': row_time.strftime('%Y-%m-%d %H:%M'),
-            'o': float(row['open']),
-            'h': float(row['high']),
-            'l': float(row['low']),
-            'c': float(row['close']),
-            'ema50': float(row['ema_fast']),
-            'ema200': float(row['ema_slow']),
-            'entry': float(entry),
-            'stop': float(stop),
-            'tp1': float(tp1),
-            'tp2': float(tp2),
-        })
-        time.sleep(0.2)
+        time.sleep(0.15)
     except Exception:
+        stats['data_error'] += 1
         continue
+
+# ---------- ذخیره CSV ----------
+if signals:
+    try:
+        df_log = pd.DataFrame(signals)
+        if os.path.exists(LOG_CSV):
+            df_log.to_csv(LOG_CSV, mode='a', header=False, index=False)
+        else:
+            df_log.to_csv(LOG_CSV, index=False)
+        print(f"💾 {len(signals)} سیگنال در {LOG_CSV} ذخیره شد.")
+    except Exception as e:
+        print(f"⚠️ خطا در ذخیره CSV: {e}")
 
 # ---------- ارسال به تلگرام ----------
 if signals:
     lines = []
-    lines.append(f"⭐ <b>ستاپ‌های A+ — پین بار صعودی در پولبک EMA{EMA_FAST}</b>")
-    lines.append(f"⏱ تایم‌فریم: {TIMEFRAME} | "
-                 f"آخرین کندل کامل‌شده: {signals[0]['time']} UTC")
+    lines.append(f"⭐ <b>ستاپ‌های A+ — پین‌بار در پولبک EMA{EMA_FAST}</b>")
+    lines.append(f"⏱ تایم‌فریم: {TIMEFRAME} | آخرین کندل: {signals[0]['time']} UTC")
     lines.append(f"⚙️ سایه≥{WICK_RATIO}x | بدنه≤{BODY_MAX_RATIO} | "
                  f"پولبک≤{PULLBACK_TOL*100}%\n")
 
     for s in signals:
+        icon = "🟢" if s['side'] == 'LONG' else "🔴"
         lines.append(
             f"━━━━━━━━━━━━━━━\n"
-            f"🌟 <b>{s['symbol']}</b> — 🟢 خرید A+\n"
+            f"🌟 <b>{s['symbol']}</b> — {icon} {s['side']}\n"
             f"🕒 کندل: {s['time']}\n"
             f"📊 OHLC: O={s['o']:.6g} H={s['h']:.6g} "
             f"L={s['l']:.6g} C={s['c']:.6g}\n"
@@ -262,24 +380,27 @@ if signals:
             f"✅ TP2 (2R): {s['tp2']:.6g}"
         )
 
-    lines.append(f"\n📅 تعداد ارزهای اسکن‌شده: {len(symbols)}")
-    lines.append(f"⭐ تعداد ستاپ A+: {len(signals)}")
-    lines.append(f"🕒 زمان اجرا: {now_utc.strftime('%Y-%m-%d %H:%M')} UTC")
+    lines.append(f"\n📅 اسکن‌شده: {stats['total']} | ⭐ سیگنال: {len(signals)}")
+    lines.append(f"🕒 {now_utc.strftime('%Y-%m-%d %H:%M')} UTC")
 
     message = "\n".join(lines)
     send_telegram_message(message)
     print("\n" + message)
 else:
-    msg = (f"⭐ اسکن A+ (پین بار صعودی EMA{EMA_FAST}) انجام شد.\n"
-           f"❌ هیچ ستاپ A+ یافت نشد.\n"
-           f"📊 آمار رد شدن:\n"
-           f"  • روند نامناسب: {rejected_stats['trend']}\n"
-           f"  • شیب EMA50 صعودی نیست: {rejected_stats['slope']}\n"
-           f"  • پولبک دقیق به EMA50: {rejected_stats['pullback']}\n"
-           f"  • پین بار ضعیف: {rejected_stats['pinbar']}\n"
-           f"  • اصلاح قبل پین بار: {rejected_stats['prev_pullback']}\n"
-           f"📅 تعداد ارزهای اسکن‌شده: {len(symbols)}\n"
-           f"🕒 {now_utc.strftime('%Y-%m-%d %H:%M')} UTC")
+    msg = (
+        f"⭐ اسکن A+ انجام شد — هیچ ستاپی یافت نشد.\n"
+        f"📊 آمار فیلترها:\n"
+        f"  • کل نمادها: {stats['total']}\n"
+        f"  • خطای داده: {stats['data_error']}\n"
+        f"  • کندل ناکافی: {stats['not_enough_bars']}\n"
+        f"  • روند نامناسب: {stats['trend']}\n"
+        f"  • شیب EMA50: {stats['slope']}\n"
+        f"  • پولبک به EMA50: {stats['pullback']}\n"
+        f"  • پین‌بار ضعیف: {stats['pinbar']}\n"
+        f"  • اصلاح قبل پین‌بار: {stats['prev_pullback']}\n"
+        f"  • RR ناکافی: {stats['rr']}\n"
+        f"🕒 {now_utc.strftime('%Y-%m-%d %H:%M')} UTC"
+    )
     send_telegram_message(msg)
     print("\n" + msg)
 
