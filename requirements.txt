@@ -1,7 +1,6 @@
 yfinance
-pycoingecko
+pandas
+numpy
 tqdm
 requests
 ccxt
-numpy
-pandas
