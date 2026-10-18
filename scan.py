@@ -13,7 +13,7 @@ PATTERN_DATE     = '2026-07-02'
 SHOW_N           = 10
 
 # --- فیلتر End Trend ---
-FILTER_END_TREND = True   # اگر False باشد، بدون فیلتر اسکن می‌کند
+FILTER_END_TREND = True
 ADX_SMOOTHING    = 14
 DI_LENGTH        = 14
 LEVEL_RANGE      = 20
@@ -76,7 +76,6 @@ def get_4h_data(ticker):
     return df_4h
 
 def candle_vector(o, h, l, c):
-    """بردار ۴بعدی نرمال‌شده‌ی کندل نسبت به دامنه High−Low"""
     rng = float(h - l)
     if rng <= 0 or not np.isfinite(rng):
         return None
@@ -88,7 +87,6 @@ def candle_vector(o, h, l, c):
     ])
 
 def compute_adx_di(df, di_len=DI_LENGTH, adx_len=ADX_SMOOTHING):
-    """محاسبه‌ی ADX و +DI و -DI مطابق فرمول Wilder (همان Gu5)"""
     high  = df['high']
     low   = df['low']
     close = df['close']
@@ -119,12 +117,18 @@ def compute_adx_di(df, di_len=DI_LENGTH, adx_len=ADX_SMOOTHING):
 
 def compute_condition_state(adx, di_plus, di_minus,
                             hl_range=LEVEL_RANGE, hl_trend=LEVEL_TREND):
-    """شبیه‌سازی ماشین حالت condition از اندیکاتور Gu5"""
+    """
+    ماشین حالت + خروجی exit_sig برای هر کندل.
+    exit_sig[i] = 1  → خروج از Long در کندل i
+    exit_sig[i] = -1 → خروج از Short در کندل i
+    exit_sig[i] = 0  → خروجی رخ نداده
+    """
     adx_a = adx.values
     dp_a  = di_plus.values
     dm_a  = di_minus.values
     n     = len(adx_a)
-    cond  = np.zeros(n)
+    cond     = np.zeros(n)
+    exit_sig = np.zeros(n, dtype=int)
 
     for i in range(1, n):
         hp      = adx_a[i]   <= hl_range
@@ -143,6 +147,12 @@ def compute_condition_state(adx, di_plus, di_minus,
         exit_long      = (cross and dup_p) or (hp and not hp_prev)
         exit_short     = (cross and ddn_p) or (hp and not hp_prev)
 
+        # ← ثبت سیگنال خروج برای همین کندل
+        if exit_long:
+            exit_sig[i] = 1
+        elif exit_short:
+            exit_sig[i] = -1
+
         prev = cond[i-1]
         if   prev !=  1   and entry_long_str:   cond[i] =  1
         elif prev != -1   and entry_short_st:   cond[i] = -1
@@ -152,7 +162,7 @@ def compute_condition_state(adx, di_plus, di_minus,
         elif prev !=  0   and exit_short:       cond[i] =  0
         else:                                   cond[i] = prev
 
-    return pd.Series(cond, index=adx.index)
+    return pd.Series(cond, index=adx.index), pd.Series(exit_sig, index=adx.index)
 
 def state_label(v):
     return {
@@ -215,26 +225,30 @@ if not symbols:
 results = []
 skipped_no_end_trend = 0
 
-for sym in tqdm(symbols, desc="اسکن ۴ ساعته + فیلتر End Trend"):
+for sym in tqdm(symbols, desc="اسکن ۴ ساعته + End Trend (همان کندل -۲)"):
     try:
         df_4h = get_4h_data(f"{sym}-USD")
         if df_4h is None or len(df_4h) < 40:
             continue
 
-        # --- محاسبه ADX / DI / condition ---
+        # --- محاسبه ADX / DI / condition + exit_sig ---
         adx, di_plus, di_minus = compute_adx_di(df_4h)
         if adx.isna().all() or len(adx) < 40:
             continue
-        cond = compute_condition_state(adx, di_plus, di_minus)
+        cond, exit_sig = compute_condition_state(adx, di_plus, di_minus)
 
-        # --- بررسی End Trend روی کندل -2 (بسته‌شده‌ی قبلی) ---
-        end_trend = (float(cond.iloc[-3]) != 0.0) and (float(cond.iloc[-2]) == 0.0)
+        # ============================================================
+        # ✅ End Trend دقیقاً روی همان کندل -۲ (کندل مقایسه‌شده)
+        #    اگر exit_sig[-2] != 0 باشد، یعنی همین کندل -۲ خروج داده
+        # ============================================================
+        exit_now  = int(exit_sig.iloc[-2])   # 1=خروج از Long, -1=خروج از Short, 0=ندارد
+        end_trend = (exit_now != 0)
 
         if FILTER_END_TREND and not end_trend:
             skipped_no_end_trend += 1
             continue
 
-        # --- شباهت کندلی ---
+        # --- شباهت کندلی روی همان کندل -۲ ---
         prev = df_4h.iloc[-2]
         vec = candle_vector(prev['open'], prev['high'],
                             prev['low'],  prev['close'])
@@ -244,18 +258,19 @@ for sym in tqdm(symbols, desc="اسکن ۴ ساعته + فیلتر End Trend"):
         dist = float(np.linalg.norm(pattern_vec - vec))
 
         results.append({
-            'symbol':        sym,
-            'dist':          dist,
-            'last_4h':       df_4h.index[-2].strftime('%Y-%m-%d %H:%M'),
+            'symbol':     sym,
+            'dist':       dist,
+            'last_4h':    df_4h.index[-2].strftime('%Y-%m-%d %H:%M'),
             'o': float(prev['open']),
             'h': float(prev['high']),
             'l': float(prev['low']),
             'c': float(prev['close']),
-            'adx':    float(adx.iloc[-2]),
+            'adx':     float(adx.iloc[-2]),
             'di_plus': float(di_plus.iloc[-2]),
-            'di_minus': float(di_minus.iloc[-2]),
-            'prev_state':  float(cond.iloc[-3]),
-            'end_trend':   end_trend,
+            'di_minus':float(di_minus.iloc[-2]),
+            'state':   float(cond.iloc[-2]),
+            'exit_type': exit_now,       # نوع خروج همین کندل
+            'end_trend': end_trend,
         })
         time.sleep(0.3)
     except Exception:
@@ -268,25 +283,31 @@ if results:
     lines.append(f"🏆 <b>کندل‌های ۴ ساعته (قبلی) مشابه کندل روزانه {PATTERN_SYMBOL} ({PATTERN_DATE})</b>\n")
     lines.append(f"الگو (روزانه): O={o:.6g} | H={h:.6g} | L={l:.6g} | C={c:.6g}")
     if FILTER_END_TREND:
-        lines.append("🔎 <i>فقط کندل‌های دارای سیگنال End Trend (پایان روند)</i>\n")
+        lines.append("🔎 <i>فقط کندل‌هایی که End Trend در همان کندل -۲ رخ داده</i>\n")
     else:
-        lines.append("🔎 <i>بدون فیلتر End Trend (فقط شباهت کندلی)</i>\n")
+        lines.append("🔎 <i>بدون فیلتر End Trend</i>\n")
 
     for _, row in df_res.iterrows():
-        trend_badge = "🟠 <b>End Trend</b>" if row['end_trend'] else "—"
+        exit_label = {
+             1: "🟢 End Trend: خروج از Long (همین کندل)",
+            -1: "🔴 End Trend: خروج از Short (همین کندل)",
+             0: "—"
+        }.get(int(row['exit_type']), "—")
+
         lines.append(
-            f"🔸 <b>{row['symbol']}</b>  (فاصله: {row['dist']:.4f})  {trend_badge}\n"
+            f"🔸 <b>{row['symbol']}</b>  (فاصله: {row['dist']:.4f})\n"
             f"   زمان ۴h: {row['last_4h']} | "
             f"O={row['o']:.6g} H={row['h']:.6g} "
             f"L={row['l']:.6g} C={row['c']:.6g}\n"
             f"   ADX={row['adx']:.2f} | +DI={row['di_plus']:.2f} | "
-            f"−DI={row['di_minus']:.2f} | وضعیت قبلی: {state_label(row['prev_state'])}"
+            f"−DI={row['di_minus']:.2f} | وضعیت کندل: {state_label(row['state'])}\n"
+            f"   {exit_label}"
         )
 
     lines.append(f"\n📅 تعداد ارزهای اسکن‌شده: {len(symbols)}")
     if FILTER_END_TREND:
-        lines.append(f"🚫 رد شده به دلیل نداشتن End Trend: {skipped_no_end_trend}")
-    lines.append(f"✅ نتایج یافت‌شده با End Trend: {len(df_res)}")
+        lines.append(f"🚫 رد شده به دلیل نداشتن End Trend در همان کندل: {skipped_no_end_trend}")
+    lines.append(f"✅ نتایج یافت‌شده: {len(df_res)}")
 
     message = "\n".join(lines)
     send_telegram_message(message)
@@ -294,7 +315,7 @@ if results:
 else:
     print("\n❌ نتیجه‌ای یافت نشد.")
     send_telegram_message(
-        "❌ در اسکن امروز هیچ کندلی با سیگنال End Trend پیدا نشد."
+        "❌ در اسکن امروز هیچ کندلی با End Trend در همان کندل -۲ پیدا نشد."
         if FILTER_END_TREND else
         "❌ در اسکن امروز هیچ نتیجه‌ای یافت نشد."
     )
