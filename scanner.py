@@ -15,11 +15,12 @@ import requests
 # ───────── تنظیمات (با env قابل تغییر) ─────────
 TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TG_CHAT = os.getenv("TELEGRAM_CHAT_ID", "")
-LOOKBACK = int(os.getenv("LOOKBACK", "15"))        # چند کندل قبل از کندل سیگنال
+LOOKBACK = int(os.getenv("LOOKBACK", "15"))              # مثلث قرمز: ۱ تا چند کندل قبل از کراس
+MACD_LOOKBACK = int(os.getenv("MACD_LOOKBACK", "3"))     # کراس مکدی: ۱ تا چند کندل قبل
 MACD_FAST, MACD_SLOW, MACD_SIG = 12, 26, 9
 ADX_SIG_LEN, DI_LEN, LVL_RANGE, LVL_TREND = 14, 14, 20, 35
 TF_SECONDS = 4 * 3600
-NOTIFY_EMPTY = os.getenv("NOTIFY_EMPTY", "0") == "1"  # اگر ۱ باشد حتی بدون نتیجه هم پیام می‌دهد
+NOTIFY_EMPTY = os.getenv("NOTIFY_EMPTY", "1") == "1"  # پیش‌فرض: حتی بدون نتیجه هم گزارش خلاصه می‌فرستد (۰ = خاموش)
 
 PERP = "https://lbkperp.lbank.com"
 YAHOO = "https://query1.finance.yahoo.com/v8/finance/chart"
@@ -176,22 +177,33 @@ def macd_cross_up(df: pd.DataFrame) -> pd.Series:
     return (macd.shift(1) <= sgn.shift(1)) & (macd > sgn)
 
 
-def check(df: pd.DataFrame):
-    """df فقط شامل کندل‌های کامل‌شده است؛ آخرین ردیف = آخرین کندل کامل."""
+def check(df: pd.DataFrame, stats=None):
+    """df فقط شامل کندل‌های کامل‌شده است؛ آخرین ردیف = آخرین کندل کامل (شماره ۱).
+    شرط ۱: مکدی در MACD_LOOKBACK (پیش‌فرض ۳) کندل اخیر سیگنال را رو به بالا کراس کرده باشد.
+    شرط ۲: ۱ تا LOOKBACK (پیش‌فرض ۱۵) کندل *قبل از کندل کراس* مثلث کوچک قرمز ADX وجود داشته باشد."""
     if df is None or len(df) < 100:
         return None
-    cross = macd_cross_up(df)
-    if not cross.iloc[-1]:
+    stats = stats if stats is not None else {}
+    stats["checked"] = stats.get("checked", 0) + 1
+
+    cross = macd_cross_up(df).to_numpy()
+    tri = adx_short_triangle(df).to_numpy()
+    n = len(df)
+    if tri[-60:].any():
+        stats["tri_60"] = stats.get("tri_60", 0) + 1      # مثلث در ۶۰ کندل اخیر (برای عیب‌یابی)
+
+    # کندل‌های کراس در MACD_LOOKBACK کندل اخیر، از جدیدترین
+    cross_pos = [n - k for k in range(1, MACD_LOOKBACK + 1) if cross[n - k]]
+    if not cross_pos:
         return None
-    tri = adx_short_triangle(df)
-    window = tri.iloc[-1 - LOOKBACK:-1]   # LOOKBACK کندل قبل از کندل سیگنال
-    if not window.any():
-        return None
-    # فاصله هر مثلث تا کندل سیگنال (۱ = کندل قبل از سیگنال، ... ، LOOKBACK)
-    idx = np.where(window.to_numpy())[0]
-    bars_ago = sorted(len(window) - int(i) for i in idx)
-    return {"close": df["c"].iloc[-1], "tri_bars_ago": bars_ago,
-            "t": pd.to_datetime(df["t"].iloc[-1], unit="s")}
+    stats["macd_cross"] = stats.get("macd_cross", 0) + 1
+
+    for j in cross_pos:
+        t_ago = [d for d in range(1, LOOKBACK + 1) if j - d >= 0 and tri[j - d]]
+        if t_ago:
+            return {"close": df["c"].iloc[-1], "macd_ago": [n - j], "tri_bars_ago": t_ago,
+                    "t": pd.to_datetime(df["t"].iloc[-1], unit="s")}
+    return None
 
 
 def telegram(text):
@@ -206,27 +218,35 @@ def telegram(text):
 def main():
     syms = futures_symbols()
     print(f"{len(syms)} futures symbols")
-    hits, skipped = [], 0
+    hits, skipped, stats, last_t = [], 0, {}, None
     for sym, yt in syms:
         df = fetch_klines(yt)
         if df is None:
             skipped += 1
             continue
-        r = check(df)
+        if df is not None and len(df):
+            last_t = max(last_t or 0, df["t"].iloc[-1])
+        r = check(df, stats)
         if r:
             hits.append((sym, r))
             print("HIT", sym, r)
         time.sleep(0.3)
 
+    lt = f"{pd.to_datetime(last_t, unit='s'):%Y-%m-%d %H:%M} UTC" if last_t else "?"
+    summary = (f"آخرین کندل کامل: {lt}\n"
+               f"ارز فیوچرز: {len(syms)} | بدون داده/تیکر یاهو: {len(syms) - stats.get('checked', 0)}\n"
+               f"بررسی‌شده: {stats.get('checked', 0)} | MACD کراس صعودی (در {MACD_LOOKBACK} کندل اخیر): {stats.get('macd_cross', 0)} "
+               f"| دارای مثلث قرمز در ۶۰ کندل اخیر: {stats.get('tri_60', 0)}")
+    print(summary)
     if hits:
         lines = [f"📈 MACD کراس صعودی + مثلث کوچک قرمز ADX (۴ساعته)\n"
-                 f"کندل: {hits[0][1]['t']:%Y-%m-%d %H:%M} UTC\n"]
+                 f"آخرین کندل کامل (شماره ۱): {hits[0][1]['t']:%Y-%m-%d %H:%M} UTC\n"]
         for sym, r in hits:
-            lines.append(f"• {sym}  قیمت بسته‌شدن: {r['close']:g}  | مثلث قرمز: {' و '.join(map(str, r['tri_bars_ago']))} کندل قبل")
-        lines.append(f"\nبررسی‌شده: {len(syms) - skipped} از {len(syms)}")
+            lines.append(f"• {sym}  قیمت بسته‌شدن: {r['close']:g}  | کراس مکدی: {' و '.join(map(str, r['macd_ago']))} کندل قبل | مثلث قرمز: {' و '.join(map(str, r['tri_bars_ago']))} کندل قبل از کراس")
+        lines.append("\n" + summary)
         telegram("\n".join(lines))
     elif NOTIFY_EMPTY:
-        telegram(f"موردی پیدا نشد. بررسی‌شده: {len(syms) - skipped} از {len(syms)}")
+        telegram("موردی پیدا نشد.\n" + summary)
     print(f"done. hits={len(hits)} skipped={skipped}")
 
 
