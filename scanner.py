@@ -14,17 +14,17 @@ import requests
 
 # ───────── تنظیمات (با env قابل تغییر) ─────────
 TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TG_CHAT = os.getenv("TELEGRAM_CHAT_ID", "")
-LOOKBACK = int(os.getenv("LOOKBACK", "15"))              # مثلث قرمز: ۱ تا چند کندل قبل از کراس
-MACD_LOOKBACK = int(os.getenv("MACD_LOOKBACK", "3"))     # کراس مکدی: ۱ تا چند کندل قبل
+TG_CHAT  = os.getenv("TELEGRAM_CHAT_ID", "")
+LOOKBACK      = int(os.getenv("LOOKBACK", "15"))       # مثلث قرمز: ۱ تا ۱۵ کندل قبل از کراس
+MACD_LOOKBACK = int(os.getenv("MACD_LOOKBACK", "3"))   # کراس مکدی: ۱ تا ۳ کندل قبل
 MACD_FAST, MACD_SLOW, MACD_SIG = 12, 26, 9
 ADX_SIG_LEN, DI_LEN, LVL_RANGE, LVL_TREND = 14, 14, 20, 35
 TF_SECONDS = 4 * 3600
-NOTIFY_EMPTY = os.getenv("NOTIFY_EMPTY", "1") == "1"  # پیش‌فرض: حتی بدون نتیجه هم گزارش خلاصه می‌فرستد (۰ = خاموش)
+NOTIFY_EMPTY = os.getenv("NOTIFY_EMPTY", "1") == "1"
 
-PERP = "https://lbkperp.lbank.com"
+PERP  = "https://lbkperp.lbank.com"
 YAHOO = "https://query1.finance.yahoo.com/v8/finance/chart"
-RANGE_DAYS = int(os.getenv("RANGE_DAYS", "60"))   # ۶۰ روز ≈ ۳۶۰ کندل ۴ساعته
+RANGE_DAYS = int(os.getenv("RANGE_DAYS", "60"))
 S = requests.Session()
 S.headers["User-Agent"] = "Mozilla/5.0"
 
@@ -68,7 +68,6 @@ def futures_symbols():
 
 # ───────── کندل‌ها از یاهو (۱ ساعته -> ۴ ساعته) ─────────
 def to_4h(df: pd.DataFrame, now=None) -> pd.DataFrame:
-    """df: ستون‌های t(ثانیه) o h l c — ۱ساعته. خروجی: ۴ساعته‌ی کامل‌شده، هم‌تراز UTC."""
     now = now or time.time()
     d = df.copy()
     d["dt"] = pd.to_datetime(d["t"], unit="s", utc=True)
@@ -77,9 +76,9 @@ def to_4h(df: pd.DataFrame, now=None) -> pd.DataFrame:
         {"o": "first", "h": "max", "l": "min", "c": "last", "t": "first"}
     )
     g["n"] = d["c"].resample("4h", origin="epoch").count()
-    g = g[g["n"] == 4].dropna()                      # فقط بازه‌های کامل (۴ کندل ساعتی)
+    g = g[g["n"] == 4].dropna()
     g["t"] = ((g.index - pd.Timestamp("1970-01-01", tz="UTC")) // pd.Timedelta(seconds=1)).astype(float)
-    g = g[g["t"] + TF_SECONDS <= now]                # کندل نیمه‌کاره حذف
+    g = g[g["t"] + TF_SECONDS <= now]
     return g[["t", "o", "h", "l", "c"]].reset_index(drop=True)
 
 
@@ -100,7 +99,6 @@ def fetch_klines(ticker):
 
 # ───────── اندیکاتورها ─────────
 def rma(x: pd.Series, n: int) -> pd.Series:
-    """Wilder RMA مثل ta.rma پاین (seed = SMA)"""
     v = x.to_numpy(dtype=float)
     out = np.full(len(v), np.nan)
     valid = np.where(~np.isnan(v))[0]
@@ -114,16 +112,15 @@ def rma(x: pd.Series, n: int) -> pd.Series:
 
 
 def adx_short_triangle(df: pd.DataFrame) -> pd.Series:
-    """سری بولین: مثلث کوچک قرمز (shortE) در هر کندل"""
     h, l, c = df["h"], df["l"], df["c"]
     up = h.diff()
     down = -l.diff()
-    plus_dm = np.where(up.isna(), np.nan, np.where((up > down) & (up > 0), up, 0.0))
+    plus_dm  = np.where(up.isna(),   np.nan, np.where((up > down) & (up > 0), up, 0.0))
     minus_dm = np.where(down.isna(), np.nan, np.where((down > up) & (down > 0), down, 0.0))
     pc = c.shift(1)
     tr = pd.concat([h - l, (h - pc).abs(), (l - pc).abs()], axis=1).max(axis=1, skipna=False)
     tr_r = rma(tr, DI_LEN)
-    plus = (100 * rma(pd.Series(plus_dm, index=df.index), DI_LEN) / tr_r).ffill()
+    plus  = (100 * rma(pd.Series(plus_dm,  index=df.index), DI_LEN) / tr_r).ffill()
     minus = (100 * rma(pd.Series(minus_dm, index=df.index), DI_LEN) / tr_r).ffill()
     sm = plus + minus
     sig = 100 * rma((plus - minus).abs() / sm.where(sm != 0, 1), ADX_SIG_LEN)
@@ -135,37 +132,31 @@ def adx_short_triangle(df: pd.DataFrame) -> pd.Series:
     for i in range(1, n):
         if np.isnan(G[i]) or np.isnan(G[i - 1]) or np.isnan(P[i]) or np.isnan(M[i]):
             continue
-        hl = G[i] <= LVL_RANGE
-        hl_prev = G[i - 1] <= LVL_RANGE
-        di_up = P[i] >= M[i]
-        di_dn = M[i] > P[i]
-        di_dn_prev = (M[i - 1] > P[i - 1]) if not np.isnan(M[i - 1]) else False
+        hl       = G[i]     <= LVL_RANGE
+        hl_prev  = G[i - 1] <= LVL_RANGE
+        di_up    = P[i] >= M[i]
+        di_dn    = M[i] >  P[i]
+        di_dn_prev = (M[i - 1] >  P[i - 1]) if not np.isnan(M[i - 1]) else False
         di_up_prev = (P[i - 1] >= M[i - 1]) if not np.isnan(M[i - 1]) else False
         sig_up = G[i] > G[i - 1]
         cross = (P[i] > M[i] and P[i - 1] <= M[i - 1]) or (P[i] < M[i] and P[i - 1] >= M[i - 1])
 
-        entry_long = (not hl and di_up and sig_up and not di_up_prev) or \
-                     (not hl and di_up and sig_up and G[i] > LVL_RANGE and hl_prev)
+        entry_long  = (not hl and di_up and sig_up and not di_up_prev) or \
+                      (not hl and di_up and sig_up and G[i] > LVL_RANGE and hl_prev)
         entry_short = (not hl and di_dn and sig_up and not di_dn_prev) or \
                       (not hl and di_dn and sig_up and G[i] > LVL_RANGE and hl_prev)
-        entry_long_str = not hl and di_up and sig_up and P[i] >= LVL_TREND
-        entry_short_st = not hl and di_dn and sig_up and M[i] > LVL_TREND
-        exit_long = (cross and di_up_prev) or (hl and not hl_prev)
+        entry_long_str  = not hl and di_up and sig_up and P[i] >= LVL_TREND
+        entry_short_st  = not hl and di_dn and sig_up and M[i] >  LVL_TREND
+        exit_long  = (cross and di_up_prev) or (hl and not hl_prev)
         exit_short = (cross and di_dn_prev) or (hl and not hl_prev)
 
         prev = cond
-        if prev != 1 and entry_long_str:
-            cond = 1
-        elif prev != -1 and entry_short_st:
-            cond = -1
-        elif prev != 0.5 and entry_long:
-            cond = 0.5
-        elif prev != -0.5 and entry_short:
-            cond = -0.5
-        elif prev != 0 and exit_long:
-            cond = 0
-        elif prev != 0 and exit_short:
-            cond = 0
+        if   prev != 1    and entry_long_str:  cond = 1
+        elif prev != -1   and entry_short_st:  cond = -1
+        elif prev != 0.5  and entry_long:      cond = 0.5
+        elif prev != -0.5 and entry_short:     cond = -0.5
+        elif prev != 0    and exit_long:       cond = 0
+        elif prev != 0    and exit_short:      cond = 0
         short_e[i] = (prev != -0.5 and cond == -0.5)
     return pd.Series(short_e, index=df.index)
 
@@ -173,35 +164,42 @@ def adx_short_triangle(df: pd.DataFrame) -> pd.Series:
 def macd_cross_up(df: pd.DataFrame) -> pd.Series:
     c = df["c"]
     macd = c.ewm(span=MACD_FAST, adjust=False).mean() - c.ewm(span=MACD_SLOW, adjust=False).mean()
-    sgn = macd.ewm(span=MACD_SIG, adjust=False).mean()
+    sgn  = macd.ewm(span=MACD_SIG,  adjust=False).mean()
     return (macd.shift(1) <= sgn.shift(1)) & (macd > sgn)
 
 
 def check(df: pd.DataFrame, stats=None):
     """df فقط شامل کندل‌های کامل‌شده است؛ آخرین ردیف = آخرین کندل کامل (شماره ۱).
-    شرط ۱: مکدی در MACD_LOOKBACK (پیش‌فرض ۳) کندل اخیر سیگنال را رو به بالا کراس کرده باشد.
-    شرط ۲: ۱ تا LOOKBACK (پیش‌فرض ۱۵) کندل *قبل از کندل کراس* مثلث کوچک قرمز ADX وجود داشته باشد."""
+    شرط ۱: مکدی در MACD_LOOKBACK کندل اخیر سیگنال را رو به بالا کراس کرده باشد.
+    شرط ۲: ۱ تا LOOKBACK کندل قبل از کندل کراس، مثلث قرمز ADX وجود داشته باشد.
+    """
     if df is None or len(df) < 100:
         return None
     stats = stats if stats is not None else {}
     stats["checked"] = stats.get("checked", 0) + 1
 
     cross = macd_cross_up(df).to_numpy()
-    tri = adx_short_triangle(df).to_numpy()
-    n = len(df)
-    if tri[-60:].any():
-        stats["tri_60"] = stats.get("tri_60", 0) + 1      # مثلث در ۶۰ کندل اخیر (برای عیب‌یابی)
+    tri   = adx_short_triangle(df).to_numpy()
+    n     = len(df)
 
-    # کندل‌های کراس در MACD_LOOKBACK کندل اخیر، از جدیدترین
+    # دیاگنوستیک: مثلث در ۲۰ کندل اخیر (بی‌ربط به کراس، فقط برای تشخیص باگ ADX)
+    if tri[-20:].any():
+        stats["tri_20"] = stats.get("tri_20", 0) + 1
+
+    # کراس در ۱..MACD_LOOKBACK کندل اخیر، از جدیدترین
     cross_pos = [n - k for k in range(1, MACD_LOOKBACK + 1) if cross[n - k]]
     if not cross_pos:
         return None
     stats["macd_cross"] = stats.get("macd_cross", 0) + 1
 
+    # شرط واقعی: مثلث در ۱..LOOKBACK کندل قبل از کراس
     for j in cross_pos:
         t_ago = [d for d in range(1, LOOKBACK + 1) if j - d >= 0 and tri[j - d]]
         if t_ago:
-            return {"close": df["c"].iloc[-1], "macd_ago": [n - j], "tri_bars_ago": t_ago,
+            stats["cross_with_tri_15"] = stats.get("cross_with_tri_15", 0) + 1
+            return {"close": df["c"].iloc[-1],
+                    "macd_ago": [n - j],
+                    "tri_bars_ago": t_ago,
                     "t": pd.to_datetime(df["t"].iloc[-1], unit="s")}
     return None
 
@@ -235,9 +233,12 @@ def main():
     lt = f"{pd.to_datetime(last_t, unit='s'):%Y-%m-%d %H:%M} UTC" if last_t else "?"
     summary = (f"آخرین کندل کامل: {lt}\n"
                f"ارز فیوچرز: {len(syms)} | بدون داده/تیکر یاهو: {len(syms) - stats.get('checked', 0)}\n"
-               f"بررسی‌شده: {stats.get('checked', 0)} | MACD کراس صعودی (در {MACD_LOOKBACK} کندل اخیر): {stats.get('macd_cross', 0)} "
-               f"| دارای مثلث قرمز در ۶۰ کندل اخیر: {stats.get('tri_60', 0)}")
+               f"بررسی‌شده: {stats.get('checked', 0)}\n"
+               f"MACD کراس صعودی (در {MACD_LOOKBACK} کندل اخیر): {stats.get('macd_cross', 0)}\n"
+               f"  ├─ دارای مثلث قرمز در ۲۰ کندل اخیر: {stats.get('tri_20', 0)}\n"
+               f"  └─ مثلث در {LOOKBACK} کندل قبل از کراس (شرط واقعی): {stats.get('cross_with_tri_15', 0)}")
     print(summary)
+
     if hits:
         lines = [f"📈 MACD کراس صعودی + مثلث کوچک قرمز ADX (۴ساعته)\n"
                  f"آخرین کندل کامل (شماره ۱): {hits[0][1]['t']:%Y-%m-%d %H:%M} UTC\n"]
