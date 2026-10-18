@@ -1,21 +1,27 @@
 name: LBank ADX-MACD scanner
 
 on:
-  schedule:
-    - cron: "2 */4 * * *"   # دو دقیقه بعد از بسته‌شدن هر کندل ۴ساعته (UTC)
-  workflow_dispatch:
+  workflow_dispatch:   # فقط اجرای دستی (Actions ← Run workflow)
 
 jobs:
   scan:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: pip
+
       - run: pip install -r requirements.txt
-      - run: python scanner.py
+
+      - name: Run scanner
+        run: python scanner.py
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          MACD_LOOKBACK: "3"     # کراس مکدی ۱ تا ۳ کندل قبل
+          LOOKBACK: "15"         # مثلث قرمز ۱ تا ۱۵ کندل قبل از کراس
+          NOTIFY_EMPTY: "1"      # بدون نتیجه هم گزارش خلاصه بفرست (۰ = خاموش)
