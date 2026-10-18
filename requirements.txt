@@ -1,6 +1,6 @@
-yfinance
-pandas
-numpy
-tqdm
-requests
-ccxt
+yfinance>=0.2.40,<0.3
+pandas>=2.0,<3.0
+numpy>=1.24,<3.0
+tqdm>=4.66,<5.0
+requests>=2.31,<3.0
+ccxt>=4.2,<5.0
