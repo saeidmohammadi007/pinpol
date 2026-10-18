@@ -119,9 +119,15 @@ def compute_condition_state(adx, di_plus, di_minus,
                             hl_range=LEVEL_RANGE, hl_trend=LEVEL_TREND):
     """
     ماشین حالت + خروجی exit_sig برای هر کندل.
-    exit_sig[i] = 1  → خروج از Long در کندل i
-    exit_sig[i] = -1 → خروج از Short در کندل i
-    exit_sig[i] = 0  → خروجی رخ نداده
+
+    ✅ اصلاح‌شده:
+    - exit_sig فقط زمانی ثبت می‌شود که واقعاً در پوزیشن هم‌جهت باشیم.
+    - شرط عمومی (hp و not hp_prev) بر اساس جهت پوزیشن تفکیک می‌شود
+      تا هم‌زمان هم exit_long و هم exit_short فعال نشوند.
+
+    exit_sig[i] =  1  → خروج از Long در کندل i
+    exit_sig[i] = -1  → خروج از Short در کندل i
+    exit_sig[i] =  0  → خروجی رخ نداده یا پوزیشن فعالی نبوده
     """
     adx_a = adx.values
     dp_a  = di_plus.values
@@ -144,22 +150,29 @@ def compute_condition_state(adx, di_plus, di_minus,
         entry_short    = (not hp) and ddn     and sig_up and (not ddn_p)
         entry_long_str = (not hp) and dup     and sig_up and (dp_a[i] >= hl_trend)
         entry_short_st = (not hp) and ddn     and sig_up and (dm_a[i] >  hl_trend)
-        exit_long      = (cross and dup_p) or (hp and not hp_prev)
-        exit_short     = (cross and ddn_p) or (hp and not hp_prev)
 
-        # ← ثبت سیگنال خروج برای همین کندل
-        if exit_long:
-            exit_sig[i] = 1
-        elif exit_short:
-            exit_sig[i] = -1
+        # شرط‌های عمومی خروج (جهت‌دار نیستند)
+        exit_long_cond  = (cross and dup_p) or (hp and not hp_prev)
+        exit_short_cond = (cross and ddn_p) or (hp and not hp_prev)
 
         prev = cond[i-1]
+
+        # ✅ فقط اگر واقعاً در پوزیشن هم‌جهت باشیم، خروج معتبر است
+        exit_long_now  = (prev > 0) and exit_long_cond
+        exit_short_now = (prev < 0) and exit_short_cond
+
+        if exit_long_now:
+            exit_sig[i] = 1
+        elif exit_short_now:
+            exit_sig[i] = -1
+
+        # --- ماشین حالت ---
         if   prev !=  1   and entry_long_str:   cond[i] =  1
         elif prev != -1   and entry_short_st:   cond[i] = -1
         elif prev !=  0.5 and entry_long:       cond[i] =  0.5
         elif prev != -0.5 and entry_short:      cond[i] = -0.5
-        elif prev !=  0   and exit_long:        cond[i] =  0
-        elif prev !=  0   and exit_short:       cond[i] =  0
+        elif exit_long_now:                     cond[i] =  0
+        elif exit_short_now:                    cond[i] =  0
         else:                                   cond[i] = prev
 
     return pd.Series(cond, index=adx.index), pd.Series(exit_sig, index=adx.index)
@@ -238,8 +251,8 @@ for sym in tqdm(symbols, desc="اسکن ۴ ساعته + End Trend (همان کن
         cond, exit_sig = compute_condition_state(adx, di_plus, di_minus)
 
         # ============================================================
-        # ✅ End Trend دقیقاً روی همان کندل -۲ (کندل مقایسه‌شده)
-        #    اگر exit_sig[-2] != 0 باشد، یعنی همین کندل -۲ خروج داده
+        # ✅ End Trend واقعی روی همان کندل -۲
+        #    exit_sig فقط وقتی != 0 می‌شود که پوزیشن فعالی بسته شود
         # ============================================================
         exit_now  = int(exit_sig.iloc[-2])   # 1=خروج از Long, -1=خروج از Short, 0=ندارد
         end_trend = (exit_now != 0)
@@ -257,6 +270,10 @@ for sym in tqdm(symbols, desc="اسکن ۴ ساعته + End Trend (همان کن
 
         dist = float(np.linalg.norm(pattern_vec - vec))
 
+        # وضعیت قبل از خروج (کندل -۳) برای نمایش شفاف
+        state_before = float(cond.iloc[-3]) if len(cond) >= 3 else 0.0
+        state_after  = float(cond.iloc[-2])
+
         results.append({
             'symbol':     sym,
             'dist':       dist,
@@ -268,8 +285,9 @@ for sym in tqdm(symbols, desc="اسکن ۴ ساعته + End Trend (همان کن
             'adx':     float(adx.iloc[-2]),
             'di_plus': float(di_plus.iloc[-2]),
             'di_minus':float(di_minus.iloc[-2]),
-            'state':   float(cond.iloc[-2]),
-            'exit_type': exit_now,       # نوع خروج همین کندل
+            'state_before': state_before,
+            'state_after':  state_after,
+            'exit_type': exit_now,
             'end_trend': end_trend,
         })
         time.sleep(0.3)
@@ -283,14 +301,14 @@ if results:
     lines.append(f"🏆 <b>کندل‌های ۴ ساعته (قبلی) مشابه کندل روزانه {PATTERN_SYMBOL} ({PATTERN_DATE})</b>\n")
     lines.append(f"الگو (روزانه): O={o:.6g} | H={h:.6g} | L={l:.6g} | C={c:.6g}")
     if FILTER_END_TREND:
-        lines.append("🔎 <i>فقط کندل‌هایی که End Trend در همان کندل -۲ رخ داده</i>\n")
+        lines.append("🔎 <i>فقط کندل‌هایی که End Trend واقعی در همان کندل -۲ رخ داده</i>\n")
     else:
         lines.append("🔎 <i>بدون فیلتر End Trend</i>\n")
 
     for _, row in df_res.iterrows():
         exit_label = {
-             1: "🟢 End Trend: خروج از Long (همین کندل)",
-            -1: "🔴 End Trend: خروج از Short (همین کندل)",
+             1: "🟢 End Trend: خروج از Long",
+            -1: "🔴 End Trend: خروج از Short",
              0: "—"
         }.get(int(row['exit_type']), "—")
 
@@ -300,13 +318,15 @@ if results:
             f"O={row['o']:.6g} H={row['h']:.6g} "
             f"L={row['l']:.6g} C={row['c']:.6g}\n"
             f"   ADX={row['adx']:.2f} | +DI={row['di_plus']:.2f} | "
-            f"−DI={row['di_minus']:.2f} | وضعیت کندل: {state_label(row['state'])}\n"
+            f"−DI={row['di_minus']:.2f}\n"
+            f"   وضعیت قبلی: {state_label(row['state_before'])} → "
+            f"وضعیت بعدی: {state_label(row['state_after'])}\n"
             f"   {exit_label}"
         )
 
     lines.append(f"\n📅 تعداد ارزهای اسکن‌شده: {len(symbols)}")
     if FILTER_END_TREND:
-        lines.append(f"🚫 رد شده به دلیل نداشتن End Trend در همان کندل: {skipped_no_end_trend}")
+        lines.append(f"🚫 رد شده به دلیل نداشتن End Trend واقعی: {skipped_no_end_trend}")
     lines.append(f"✅ نتایج یافت‌شده: {len(df_res)}")
 
     message = "\n".join(lines)
@@ -315,7 +335,7 @@ if results:
 else:
     print("\n❌ نتیجه‌ای یافت نشد.")
     send_telegram_message(
-        "❌ در اسکن امروز هیچ کندلی با End Trend در همان کندل -۲ پیدا نشد."
+        "❌ در اسکن امروز هیچ کندلی با End Trend واقعی در کندل -۲ پیدا نشد."
         if FILTER_END_TREND else
         "❌ در اسکن امروز هیچ نتیجه‌ای یافت نشد."
     )
