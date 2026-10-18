@@ -87,13 +87,6 @@ def candle_vector(o, h, l, c):
         (float(c) - float(l)) / rng,
     ])
 
-def compute_macd(close_series, fast=12, slow=26, signal=9):
-    ema_fast = close_series.ewm(span=fast, adjust=False).mean()
-    ema_slow = close_series.ewm(span=slow, adjust=False).mean()
-    macd_line = ema_fast - ema_slow
-    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
-    return macd_line, signal_line
-
 def compute_adx_di(df, di_len=DI_LENGTH, adx_len=ADX_SMOOTHING):
     """محاسبه‌ی ADX و +DI و -DI مطابق فرمول Wilder (همان Gu5)"""
     high  = df['high']
@@ -235,7 +228,6 @@ for sym in tqdm(symbols, desc="اسکن ۴ ساعته + فیلتر End Trend"):
         cond = compute_condition_state(adx, di_plus, di_minus)
 
         # --- بررسی End Trend روی کندل -2 (بسته‌شده‌ی قبلی) ---
-        # End Trend = حالت قبلی غیرخنثی بود و در کندل -2 به صفر برگشت
         end_trend = (float(cond.iloc[-3]) != 0.0) and (float(cond.iloc[-2]) == 0.0)
 
         if FILTER_END_TREND and not end_trend:
@@ -251,8 +243,6 @@ for sym in tqdm(symbols, desc="اسکن ۴ ساعته + فیلتر End Trend"):
 
         dist = float(np.linalg.norm(pattern_vec - vec))
 
-        macd_line, signal_line = compute_macd(df_4h['close'])
-
         results.append({
             'symbol':        sym,
             'dist':          dist,
@@ -261,8 +251,6 @@ for sym in tqdm(symbols, desc="اسکن ۴ ساعته + فیلتر End Trend"):
             'h': float(prev['high']),
             'l': float(prev['low']),
             'c': float(prev['close']),
-            'macd':   float(macd_line.iloc[-2]),
-            'signal': float(signal_line.iloc[-2]),
             'adx':    float(adx.iloc[-2]),
             'di_plus': float(di_plus.iloc[-2]),
             'di_minus': float(di_minus.iloc[-2]),
@@ -291,7 +279,6 @@ if results:
             f"   زمان ۴h: {row['last_4h']} | "
             f"O={row['o']:.6g} H={row['h']:.6g} "
             f"L={row['l']:.6g} C={row['c']:.6g}\n"
-            f"   MACD={row['macd']:.4g} | Signal={row['signal']:.4g}\n"
             f"   ADX={row['adx']:.2f} | +DI={row['di_plus']:.2f} | "
             f"−DI={row['di_minus']:.2f} | وضعیت قبلی: {state_label(row['prev_state'])}"
         )
