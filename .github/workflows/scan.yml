@@ -1,7 +1,7 @@
 name: اسکن A+ پین بار
 
 on:
-  workflow_dispatch:   # فقط دستی اجرا میشه
+  workflow_dispatch:
 
 jobs:
   scan:
@@ -16,6 +16,7 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+          cache: 'pip'
 
       - name: نصب پکیج‌ها
         run: |
@@ -27,3 +28,13 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: python scan.py
+
+      - name: اطلاع خطا در تلگرام
+        if: failure()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -d chat_id="${TELEGRAM_CHAT_ID}" \
+            -d text="❌ اسکن A+ پین بار شکست خورد. لاگ‌های GitHub Actions را بررسی کن."
