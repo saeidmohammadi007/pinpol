@@ -1,7 +1,8 @@
 """
 LBank futures scanner (4h)
 شرط: روی آخرین کندل کامل‌شده، MACD سیگنال را رو به بالا کراس کرده
-      و در LOOKBACK کندل قبل از آن، مثلث کوچک قرمز اندیکاتور ADX Di+ Di- [Gu5] (shortE) داشته.
+      و در LOOKBACK کندل اخیر (بدون قید قبل/بعد کراس)، مثلث کوچک قرمز
+      اندیکاتور ADX Di+ Di- [Gu5] (shortE) داشته.
 نتیجه به تلگرام فرستاده می‌شود.
 """
 import os
@@ -15,7 +16,7 @@ import requests
 # ───────── تنظیمات (با env قابل تغییر) ─────────
 TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TG_CHAT  = os.getenv("TELEGRAM_CHAT_ID", "")
-LOOKBACK      = int(os.getenv("LOOKBACK", "15"))       # مثلث قرمز: ۱ تا ۱۵ کندل قبل از کراس
+LOOKBACK      = int(os.getenv("LOOKBACK", "20"))       # مثلث قرمز: در چند کندل اخیر
 MACD_LOOKBACK = int(os.getenv("MACD_LOOKBACK", "3"))   # کراس مکدی: ۱ تا ۳ کندل قبل
 MACD_FAST, MACD_SLOW, MACD_SIG = 12, 26, 9
 ADX_SIG_LEN, DI_LEN, LVL_RANGE, LVL_TREND = 14, 14, 20, 35
@@ -171,7 +172,8 @@ def macd_cross_up(df: pd.DataFrame) -> pd.Series:
 def check(df: pd.DataFrame, stats=None):
     """df فقط شامل کندل‌های کامل‌شده است؛ آخرین ردیف = آخرین کندل کامل (شماره ۱).
     شرط ۱: مکدی در MACD_LOOKBACK کندل اخیر سیگنال را رو به بالا کراس کرده باشد.
-    شرط ۲: ۱ تا LOOKBACK کندل قبل از کندل کراس، مثلث قرمز ADX وجود داشته باشد.
+    شرط ۲: مثلث قرمز ADX در LOOKBACK کندل اخیر وجود داشته باشد
+          (بدون قید قبل/هم‌زمان/بعد از کراس).
     """
     if df is None or len(df) < 100:
         return None
@@ -182,26 +184,31 @@ def check(df: pd.DataFrame, stats=None):
     tri   = adx_short_triangle(df).to_numpy()
     n     = len(df)
 
-    # دیاگنوستیک: مثلث در ۲۰ کندل اخیر (بی‌ربط به کراس، فقط برای تشخیص باگ ADX)
-    if tri[-20:].any():
-        stats["tri_20"] = stats.get("tri_20", 0) + 1
-
-    # کراس در ۱..MACD_LOOKBACK کندل اخیر، از جدیدترین
+    # کراس در ۱..MACD_LOOKBACK کندل اخیر
     cross_pos = [n - k for k in range(1, MACD_LOOKBACK + 1) if cross[n - k]]
     if not cross_pos:
         return None
     stats["macd_cross"] = stats.get("macd_cross", 0) + 1
 
-    # شرط واقعی: مثلث در ۱..LOOKBACK کندل قبل از کراس
+    # شرط ۲: مثلث در LOOKBACK کندل اخیر
+    tri_ago = [d for d in range(1, LOOKBACK + 1) if n - d >= 0 and tri[n - d]]
+    if not tri_ago:
+        return None
+    stats["cross_with_tri"] = stats.get("cross_with_tri", 0) + 1
+
+    # دیاگنوستیک: چند تا از این‌ها شرط قدیمی (مثلث فقط قبل از کراس) را داشتند؟
+    old_ok = False
     for j in cross_pos:
-        t_ago = [d for d in range(1, LOOKBACK + 1) if j - d >= 0 and tri[j - d]]
-        if t_ago:
-            stats["cross_with_tri_15"] = stats.get("cross_with_tri_15", 0) + 1
-            return {"close": df["c"].iloc[-1],
-                    "macd_ago": [n - j],
-                    "tri_bars_ago": t_ago,
-                    "t": pd.to_datetime(df["t"].iloc[-1], unit="s")}
-    return None
+        if any(j - d >= 0 and tri[j - d] for d in range(1, LOOKBACK + 1)):
+            old_ok = True
+            break
+    if old_ok:
+        stats["cross_with_tri_before"] = stats.get("cross_with_tri_before", 0) + 1
+
+    return {"close": df["c"].iloc[-1],
+            "macd_ago": [n - j for j in cross_pos],
+            "tri_bars_ago": tri_ago,
+            "t": pd.to_datetime(df["t"].iloc[-1], unit="s")}
 
 
 def telegram(text):
@@ -235,15 +242,19 @@ def main():
                f"ارز فیوچرز: {len(syms)} | بدون داده/تیکر یاهو: {len(syms) - stats.get('checked', 0)}\n"
                f"بررسی‌شده: {stats.get('checked', 0)}\n"
                f"MACD کراس صعودی (در {MACD_LOOKBACK} کندل اخیر): {stats.get('macd_cross', 0)}\n"
-               f"  ├─ دارای مثلث قرمز در ۲۰ کندل اخیر: {stats.get('tri_20', 0)}\n"
-               f"  └─ مثلث در {LOOKBACK} کندل قبل از کراس (شرط واقعی): {stats.get('cross_with_tri_15', 0)}")
+               f"  ├─ دارای مثلث در {LOOKBACK} کندل اخیر (شرط جدید): {stats.get('cross_with_tri', 0)}\n"
+               f"  └─ [دیاگنوستیک] دارای مثلث فقط قبل از کراس (شرط قدیمی): {stats.get('cross_with_tri_before', 0)}")
     print(summary)
 
     if hits:
-        lines = [f"📈 MACD کراس صعودی + مثلث کوچک قرمز ADX (۴ساعته)\n"
+        lines = [f"📈 MACD کراس صعودی + مثلث قرمز ADX (۴ساعته)\n"
                  f"آخرین کندل کامل (شماره ۱): {hits[0][1]['t']:%Y-%m-%d %H:%M} UTC\n"]
         for sym, r in hits:
-            lines.append(f"• {sym}  قیمت بسته‌شدن: {r['close']:g}  | کراس مکدی: {' و '.join(map(str, r['macd_ago']))} کندل قبل | مثلث قرمز: {' و '.join(map(str, r['tri_bars_ago']))} کندل قبل از کراس")
+            lines.append(
+                f"• {sym}  قیمت: {r['close']:g}  | "
+                f"کراس مکدی: {' و '.join(map(str, r['macd_ago']))} کندل قبل | "
+                f"مثلث قرمز: {' و '.join(map(str, r['tri_bars_ago']))} کندل قبل"
+            )
         lines.append("\n" + summary)
         telegram("\n".join(lines))
     elif NOTIFY_EMPTY:
