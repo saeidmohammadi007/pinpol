@@ -3,7 +3,7 @@ LBank futures scanner (4h)
 شرط: روی آخرین کندل کامل‌شده، MACD سیگنال را رو به بالا کراس کرده
       و در LOOKBACK کندل اخیر (بدون قید قبل/بعد کراس)، مثلث کوچک قرمز
       اندیکاتور ADX Di+ Di- [Gu5] (shortE) داشته.
-نتیجه به تلگرام فرستاده می‌شود.
+نتیجه به تلگرام فرستاده می‌شود (با تاریخ و ساعت کراس و مثلث).
 """
 import os
 import sys
@@ -174,6 +174,7 @@ def check(df: pd.DataFrame, stats=None):
     شرط ۱: مکدی در MACD_LOOKBACK کندل اخیر سیگنال را رو به بالا کراس کرده باشد.
     شرط ۲: مثلث قرمز ADX در LOOKBACK کندل اخیر وجود داشته باشد
           (بدون قید قبل/هم‌زمان/بعد از کراس).
+    خروجی شامل تایم‌استمپ (UTC) هر کراس و هر مثلث است.
     """
     if df is None or len(df) < 100:
         return None
@@ -191,8 +192,8 @@ def check(df: pd.DataFrame, stats=None):
     stats["macd_cross"] = stats.get("macd_cross", 0) + 1
 
     # شرط ۲: مثلث در LOOKBACK کندل اخیر
-    tri_ago = [d for d in range(1, LOOKBACK + 1) if n - d >= 0 and tri[n - d]]
-    if not tri_ago:
+    tri_pos = [n - d for d in range(1, LOOKBACK + 1) if n - d >= 0 and tri[n - d]]
+    if not tri_pos:
         return None
     stats["cross_with_tri"] = stats.get("cross_with_tri", 0) + 1
 
@@ -205,10 +206,14 @@ def check(df: pd.DataFrame, stats=None):
     if old_ok:
         stats["cross_with_tri_before"] = stats.get("cross_with_tri_before", 0) + 1
 
-    return {"close": df["c"].iloc[-1],
-            "macd_ago": [n - j for j in cross_pos],
-            "tri_bars_ago": tri_ago,
-            "t": pd.to_datetime(df["t"].iloc[-1], unit="s")}
+    return {
+        "close":        df["c"].iloc[-1],
+        "macd_ago":     [n - j for j in cross_pos],
+        "macd_ts":      [int(df["t"].iloc[j]) for j in cross_pos],
+        "tri_bars_ago": [n - j for j in tri_pos],
+        "tri_ts":       [int(df["t"].iloc[j]) for j in tri_pos],
+        "t":            pd.to_datetime(df["t"].iloc[-1], unit="s"),
+    }
 
 
 def telegram(text):
@@ -216,11 +221,20 @@ def telegram(text):
         print(text)
         return
     for i in range(0, len(text), 3800):
-        requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
-                      data={"chat_id": TG_CHAT, "text": text[i:i + 3800]}, timeout=20)
+        try:
+            requests.post(f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
+                          data={"chat_id": TG_CHAT, "text": text[i:i + 3800]}, timeout=20)
+        except Exception as e:
+            print(f"telegram send error: {e}")
+
+
+def fmt_ts(ts):
+    """تایم‌استمپ UTC -> رشته تاریخ/ساعت (شروع کندل)."""
+    return pd.to_datetime(ts, unit="s").strftime("%Y-%m-%d %H:%M")
 
 
 def main():
+    print(f"config: LOOKBACK={LOOKBACK} MACD_LOOKBACK={MACD_LOOKBACK} RANGE_DAYS={RANGE_DAYS}")
     syms = futures_symbols()
     print(f"{len(syms)} futures symbols")
     hits, skipped, stats, last_t = [], 0, {}, None
@@ -250,10 +264,12 @@ def main():
         lines = [f"📈 MACD کراس صعودی + مثلث قرمز ADX (۴ساعته)\n"
                  f"آخرین کندل کامل (شماره ۱): {hits[0][1]['t']:%Y-%m-%d %H:%M} UTC\n"]
         for sym, r in hits:
+            macd_times = " , ".join(f"{fmt_ts(t)} UTC" for t in r["macd_ts"])
+            tri_times  = " , ".join(f"{fmt_ts(t)} UTC" for t in r["tri_ts"])
             lines.append(
-                f"• {sym}  قیمت: {r['close']:g}  | "
-                f"کراس مکدی: {' و '.join(map(str, r['macd_ago']))} کندل قبل | "
-                f"مثلث قرمز: {' و '.join(map(str, r['tri_bars_ago']))} کندل قبل"
+                f"• {sym}  قیمت: {r['close']:g}\n"
+                f"   🕐 کراس مکدی: {macd_times}\n"
+                f"   🔺 مثلث قرمز: {tri_times}"
             )
         lines.append("\n" + summary)
         telegram("\n".join(lines))
