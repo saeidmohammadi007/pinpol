@@ -1,12 +1,16 @@
 name: LBank ADX-MACD scanner
 
 on:
-  workflow_dispatch:   # فقط اجرای دستی (Actions ← Run workflow)
+  workflow_dispatch:        # فقط اجرای دستی از Actions ← Run workflow
+
+permissions:
+  contents: read
 
 jobs:
   scan:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+
     steps:
       - uses: actions/checkout@v4
 
@@ -15,13 +19,24 @@ jobs:
           python-version: "3.11"
           cache: pip
 
-      - run: pip install -r requirements.txt
+      - name: Install dependencies
+        run: pip install -r requirements.txt
 
       - name: Run scanner
         run: python scanner.py
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          MACD_LOOKBACK: "3"     # کراس مکدی ۱ تا ۳ کندل قبل
-          LOOKBACK: "15"         # مثلث قرمز ۱ تا ۱۵ کندل قبل از کراس
-          NOTIFY_EMPTY: "1"      # بدون نتیجه هم گزارش خلاصه بفرست (۰ = خاموش)
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+
+          # کراس MACD صعودی: در ۱ تا ۳ کندل اخیر (آخرین کندل کامل = #1)
+          MACD_LOOKBACK: "3"
+
+          # مثلث قرمز ADX (shortE): در ۱ تا ۱۵ کندل اخیر
+          # ⚠️ بدون قید ترتیب نسبت به کراس — می‌تواند قبل، بعد یا هم‌زمان باشد
+          LOOKBACK: "15"
+
+          # ارسال خلاصه آماری حتی وقتی هیچ سیگنالی پیدا نشد (0 = خاموش)
+          NOTIFY_EMPTY: "1"
+
+          # تعداد روزهای داده ۱ساعته دریافتی از Yahoo
+          RANGE_DAYS: "60"
