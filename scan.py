@@ -13,6 +13,7 @@ SHOW_N           = 10
 
 # --- فیلتر End Trend ---
 FILTER_END_TREND = True
+LOOKBACK         = 3        # چند کندل بسته‌شدهٔ اخیر برای دیدن End Trend
 ADX_SMOOTHING    = 14
 DI_LENGTH        = 14
 LEVEL_RANGE      = 20
@@ -20,8 +21,12 @@ LEVEL_TREND      = 35
 
 # --- داده ---
 TIMEFRAME        = '4h'
+TF_HOURS         = 4
 OHLCV_LIMIT      = 500
-DEMO_DEBUG_SYM   = 'MRK'   # برای چاپ تاریخچه ADX این نماد
+DEMO_DEBUG_SYM   = 'MRK'
+MAX_ERR_PRINT    = 5        # چند خطای اول چاپ شود
+
+err_count = 0
 
 # ---------- LBank ----------
 def init_lbank():
@@ -49,19 +54,33 @@ def build_symbol_map(ex):
     return out
 
 def fetch_4h(ex, unified):
-    try:
-        raw = ex.fetch_ohlcv(unified, TIMEFRAME, limit=OHLCV_LIMIT)
-        if not raw or len(raw) < 60:
-            return None
-        df = pd.DataFrame(raw, columns=['ts','open','high','low','close','volume'])
-        df['ts'] = pd.to_datetime(df['ts'], unit='ms', utc=True)
-        df.set_index('ts', inplace=True)
-        df.index = df.index.tz_localize(None)
-        return df[['open','high','low','close']]
-    except Exception:
+    global err_count
+    since = ex.milliseconds() - OHLCV_LIMIT * TF_HOURS * 3600 * 1000
+    raw = None
+    last_exc = None
+    # اول با since، اگر نشد بدون since
+    for kwargs in ({'since': since, 'limit': OHLCV_LIMIT}, {'limit': OHLCV_LIMIT}):
+        try:
+            raw = ex.fetch_ohlcv(unified, TIMEFRAME, **kwargs)
+            if raw:
+                break
+        except Exception as e:
+            last_exc = e
+    if not raw:
+        if last_exc is not None and err_count < MAX_ERR_PRINT:
+            err_count += 1
+            print(f"\n⚠️ خطا برای {unified}: {type(last_exc).__name__}: {last_exc}")
         return None
+    if len(raw) < 60:
+        return None
+    df = pd.DataFrame(raw, columns=['ts','open','high','low','close','volume'])
+    df['ts'] = pd.to_datetime(df['ts'], unit='ms', utc=True)
+    df = df.drop_duplicates('ts').sort_values('ts')
+    df.set_index('ts', inplace=True)
+    df.index = df.index.tz_localize(None)
+    return df[['open','high','low','close']]
 
-def drop_forming(df, tf_hours=4):
+def drop_forming(df, tf_hours=TF_HOURS):
     if df is None or len(df) == 0:
         return df
     now = pd.Timestamp.utcnow().tz_localize(None)
@@ -76,6 +95,8 @@ def get_ref():
                      progress=False, auto_adjust=False)
     if df.empty:
         return None
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
     df = df[['Open','High','Low','Close']].copy()
     df.index = pd.to_datetime(df.index)
     df.columns = ['open','high','low','close']
@@ -191,11 +212,20 @@ for base in tqdm(sorted(smap.keys()), desc="اسکن 4h (LBank)"):
         df_closed = drop_forming(df)
         if len(df_closed) < 60:
             skip_nd += 1; continue
-        si = len(df_closed) - 1   # آخرین کندل بسته‌شده
+        last = len(df_closed) - 1   # آخرین کندل بسته‌شده
 
-        ex_v = int(exs.iloc[si])
-        if FILTER_END_TREND and ex_v == 0:
-            skip_nt += 1; continue
+        # پیدا کردن آخرین End Trend در LOOKBACK کندل اخیر
+        si = last
+        ex_v = int(exs.iloc[last])
+        if FILTER_END_TREND:
+            si = None
+            for i in range(last, max(last - LOOKBACK, 0), -1):
+                if int(exs.iloc[i]) != 0:
+                    si = i
+                    break
+            if si is None:
+                skip_nt += 1; continue
+            ex_v = int(exs.iloc[si])
 
         row = df.iloc[si]
         v = vec(row['open'], row['high'], row['low'], row['close'])
@@ -205,6 +235,7 @@ for base in tqdm(sorted(smap.keys()), desc="اسکن 4h (LBank)"):
         results.append({
             'sym': base, 'dist': d,
             'ts': df.index[si].strftime('%Y-%m-%d %H:%M UTC'),
+            'ago': last - si,
             'o':float(row['open']), 'h':float(row['high']),
             'l':float(row['low']),  'c':float(row['close']),
             'adx':   float(adx.iloc[si]),
@@ -225,27 +256,36 @@ for base in tqdm(sorted(smap.keys()), desc="اسکن 4h (LBank)"):
                       f"state={cond.iloc[i]:+.1f} exit={int(exs.iloc[i])}{mark}")
 
         time.sleep(0.3)
-    except Exception:
+    except Exception as e:
+        if err_count < MAX_ERR_PRINT:
+            err_count += 1
+            print(f"\n⚠️ خطا در پردازش {base}: {type(e).__name__}: {e}")
         continue
+
+# ---------- تشخیص ----------
+print(f"\nno_data={skip_nd} | no_end_trend={skip_nt} | "
+      f"total={len(smap)} | results={len(results)}")
 
 # ---------- گزارش ----------
 if not results:
-    msg = "❌ هیچ کندلی با End Trend واقعی در آخرین کندل بسته‌شده یافت نشد."
+    msg = (f"❌ هیچ کندلی با End Trend در {LOOKBACK} کندل بسته‌شدهٔ اخیر یافت نشد.\n"
+           f"📊 اسکن: {len(smap)} | بدون داده: {skip_nd} | بدون End Trend: {skip_nt}")
     print("\n"+msg); tg(msg); exit()
 
 df_r = pd.DataFrame(results).sort_values('dist').head(SHOW_N)
 
 lines = [f"🏆 <b>مشابه الگوی {PATTERN_SYMBOL} ({PATTERN_DATE})</b>\n",
          f"الگو: O={o:.6g} H={h:.6g} L={l:.6g} C={c:.6g}",
-         "🔎 <i>داده مستقیم از LBank | سیگنال روی آخرین کندل بسته‌شده 4h (UTC)</i>\n"]
+         f"🔎 <i>داده مستقیم از LBank | End Trend در {LOOKBACK} کندل بسته‌شدهٔ اخیر 4h (UTC)</i>\n"]
 
 for _, r in df_r.iterrows():
     ex_lbl = {1:"🟢 خروج از Long", -1:"🔴 خروج از Short"}.get(int(r['ex']),"")
     adx_p_s = f"{r['adx_p']:.2f}" if pd.notna(r['adx_p']) else "—"
     warn = " ⚠️ مرزی" if 19.5 <= r['adx'] <= 20.5 else ""
+    ago_s = "آخرین کندل" if int(r['ago']) == 0 else f"{int(r['ago'])} کندل قبل"
     lines.append(
         f"🔸 <b>{r['sym']}</b> (فاصله: {r['dist']:.4f})\n"
-        f"   کندل: {r['ts']}\n"
+        f"   کندل: {r['ts']} ({ago_s})\n"
         f"   O={r['o']:.6g} H={r['h']:.6g} L={r['l']:.6g} C={r['c']:.6g}\n"
         f"   ADX={r['adx']:.3f}{warn} (قبلی: {adx_p_s}) | "
         f"+DI={r['pdi']:.2f} | -DI={r['mdi']:.2f}\n"
