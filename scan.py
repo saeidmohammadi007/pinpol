@@ -1,13 +1,12 @@
 import os
 import pandas as pd
 import numpy as np
-import yfinance as yf
 from tqdm import tqdm
 import time
 import requests
 import ccxt
 
-# --- الگوی مرجع: تک‌کندل روزانه ETH ---
+# --- الگوی مرجع ---
 PATTERN_SYMBOL   = 'ETH-USD'
 PATTERN_DATE     = '2026-07-02'
 SHOW_N           = 10
@@ -19,325 +18,243 @@ DI_LENGTH        = 14
 LEVEL_RANGE      = 20
 LEVEL_TREND      = 35
 
-# ---------- توابع ----------
-def get_lbank_futures_symbols():
-    exchange = ccxt.lbank({'options': {'defaultType': 'future'}})
+# --- داده ---
+TIMEFRAME        = '4h'
+OHLCV_LIMIT      = 500
+DEMO_DEBUG_SYM   = 'MRK'   # برای چاپ تاریخچه ADX این نماد
+
+# ---------- LBank ----------
+def init_lbank():
+    ex = ccxt.lbank({
+        'options': {'defaultType': 'future'},
+        'enableRateLimit': True,
+    })
+    ex.load_markets()
+    return ex
+
+def build_symbol_map(ex):
+    out = {}
+    for sym, m in ex.markets.items():
+        if not m.get('swap'):
+            continue
+        base = m.get('base')
+        quote = m.get('quote')
+        if not base:
+            continue
+        b = base.upper()
+        if quote == 'USDT':
+            out[b] = sym
+        elif b not in out:
+            out[b] = sym
+    return out
+
+def fetch_4h(ex, unified):
     try:
-        markets = exchange.load_markets()
-    except Exception as e:
-        print(f"❌ خطا در اتصال به LBank: {e}")
-        return []
-
-    base_list = []
-    for symbol, market in markets.items():
-        if not market.get('swap'):
-            continue
-        base = market.get('base')
-        if not base or base.isdigit():
-            continue
-        base_list.append(base.upper())
-
-    seen, unique_bases = set(), []
-    for b in base_list:
-        if b not in seen:
-            seen.add(b)
-            unique_bases.append(b)
-    print(f"✅ تعداد ارزهای پایه‌ی منحصربه‌فرد فیوچرز LBank: {len(unique_bases)}")
-    return unique_bases
-
-def get_daily_data(ticker, start='2024-01-01'):
-    df = yf.download(ticker, start=start, interval='1d',
-                     progress=False, auto_adjust=False)
-    if df.empty:
+        raw = ex.fetch_ohlcv(unified, TIMEFRAME, limit=OHLCV_LIMIT)
+        if not raw or len(raw) < 60:
+            return None
+        df = pd.DataFrame(raw, columns=['ts','open','high','low','close','volume'])
+        df['ts'] = pd.to_datetime(df['ts'], unit='ms', utc=True)
+        df.set_index('ts', inplace=True)
+        df.index = df.index.tz_localize(None)
+        return df[['open','high','low','close']]
+    except Exception:
         return None
-    df = df[['Open', 'High', 'Low', 'Close']].copy()
-    df.index = pd.to_datetime(df.index)
-    df.columns = ['open', 'high', 'low', 'close']
+
+def drop_forming(df, tf_hours=4):
+    if df is None or len(df) == 0:
+        return df
+    now = pd.Timestamp.utcnow().tz_localize(None)
+    if df.index[-1] + pd.Timedelta(hours=tf_hours) > now:
+        return df.iloc[:-1]
     return df
 
-def get_4h_data(ticker):
-    df = yf.download(ticker, period='60d', interval='1h',
+# ---------- reference ----------
+def get_ref():
+    import yfinance as yf
+    df = yf.download(PATTERN_SYMBOL, start='2024-01-01', interval='1d',
                      progress=False, auto_adjust=False)
     if df.empty:
         return None
-    df = df[['Open', 'High', 'Low', 'Close']].copy()
+    df = df[['Open','High','Low','Close']].copy()
     df.index = pd.to_datetime(df.index)
-    df.columns = ['open', 'high', 'low', 'close']
+    df.columns = ['open','high','low','close']
+    return df
 
-    if df.index.tz is not None:
-        df.index = df.index.tz_localize(None)
-
-    df_4h = df.resample('4h').agg({
-        'open':   'first',
-        'high':   'max',
-        'low':    'min',
-        'close':  'last',
-    }).dropna()
-    return df_4h
-
-def candle_vector(o, h, l, c):
+def vec(o,h,l,c):
     rng = float(h - l)
     if rng <= 0 or not np.isfinite(rng):
         return None
-    return np.array([
-        (float(o) - float(l)) / rng,
-        1.0,
-        0.0,
-        (float(c) - float(l)) / rng,
-    ])
+    return np.array([(o-l)/rng, 1.0, 0.0, (c-l)/rng])
 
-def compute_adx_di(df, di_len=DI_LENGTH, adx_len=ADX_SMOOTHING):
-    high  = df['high']
-    low   = df['low']
-    close = df['close']
+# ---------- ADX ----------
+def adx_di(df, n_di=DI_LENGTH, n_adx=ADX_SMOOTHING):
+    H, L, C = df['high'], df['low'], df['close']
+    up, dn = H.diff(), -L.diff()
+    pdm = pd.Series(np.where((up>dn)&(up>0), up, 0.0), index=df.index)
+    mdm = pd.Series(np.where((dn>up)&(dn>0), dn, 0.0), index=df.index)
+    tr = pd.concat([H-L, (H-C.shift()).abs(), (L-C.shift()).abs()], axis=1).max(axis=1)
+    def rma(s,n): return s.ewm(alpha=1/n, adjust=False).mean()
+    trr = rma(tr, n_di)
+    pdi = 100 * rma(pdm, n_di) / trr
+    mdi = 100 * rma(mdm, n_di) / trr
+    dx  = 100 * (pdi - mdi).abs() / (pdi + mdi).replace(0, np.nan)
+    return rma(dx.fillna(0), n_adx), pdi, mdi
 
-    up   = high.diff()
-    down = -low.diff()
-
-    plus_dm  = pd.Series(np.where((up > down) & (up > 0), up, 0.0), index=df.index)
-    minus_dm = pd.Series(np.where((down > up) & (down > 0), down, 0.0), index=df.index)
-
-    tr1 = high - low
-    tr2 = (high - close.shift()).abs()
-    tr3 = (low  - close.shift()).abs()
-    tr  = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-
-    def rma(s, n):
-        return s.ewm(alpha=1.0 / n, adjust=False).mean()
-
-    tr_rma   = rma(tr, di_len)
-    plus_di  = 100 * rma(plus_dm,  di_len) / tr_rma
-    minus_di = 100 * rma(minus_dm, di_len) / tr_rma
-
-    denom = (plus_di + minus_di).replace(0, np.nan)
-    dx    = 100 * (plus_di - minus_di).abs() / denom
-    adx   = rma(dx.fillna(0), adx_len)
-
-    return adx, plus_di, minus_di
-
-def compute_condition_state(adx, di_plus, di_minus,
-                            hl_range=LEVEL_RANGE, hl_trend=LEVEL_TREND):
-    """
-    ماشین حالت + خروجی exit_sig برای هر کندل.
-
-    ✅ اصلاح‌شده:
-    - exit_sig فقط زمانی ثبت می‌شود که واقعاً در پوزیشن هم‌جهت باشیم.
-    - شرط عمومی (hp و not hp_prev) بر اساس جهت پوزیشن تفکیک می‌شود
-      تا هم‌زمان هم exit_long و هم exit_short فعال نشوند.
-
-    exit_sig[i] =  1  → خروج از Long در کندل i
-    exit_sig[i] = -1  → خروج از Short در کندل i
-    exit_sig[i] =  0  → خروجی رخ نداده یا پوزیشن فعالی نبوده
-    """
-    adx_a = adx.values
-    dp_a  = di_plus.values
-    dm_a  = di_minus.values
-    n     = len(adx_a)
-    cond     = np.zeros(n)
-    exit_sig = np.zeros(n, dtype=int)
-
+def state_machine(adx, pdi, mdi, hr=LEVEL_RANGE, ht=LEVEL_TREND):
+    a, p, m = adx.values, pdi.values, mdi.values
+    n = len(a)
+    cond = np.zeros(n)
+    ex   = np.zeros(n, dtype=int)
     for i in range(1, n):
-        hp      = adx_a[i]   <= hl_range
-        hp_prev = adx_a[i-1] <= hl_range
-        dup     = dp_a[i]    >= dm_a[i]
-        dup_p   = dp_a[i-1]  >= dm_a[i-1]
-        ddn     = dm_a[i]    >  dp_a[i]
-        ddn_p   = dm_a[i-1]  >  dp_a[i-1]
-        cross   = dup != dup_p
-        sig_up  = adx_a[i] > adx_a[i-1]
+        hp, hp_p = a[i] <= hr, a[i-1] <= hr
+        up_, up_p = p[i] >= m[i], p[i-1] >= m[i-1]
+        dn_, dn_p = m[i] >  p[i], m[i-1] >  p[i-1]
+        cross  = up_ != up_p
+        rising = a[i] > a[i-1]
 
-        entry_long     = (not hp) and dup     and sig_up and (not dup_p)
-        entry_short    = (not hp) and ddn     and sig_up and (not ddn_p)
-        entry_long_str = (not hp) and dup     and sig_up and (dp_a[i] >= hl_trend)
-        entry_short_st = (not hp) and ddn     and sig_up and (dm_a[i] >  hl_trend)
+        e_long   = (not hp) and up_ and rising and (not up_p)
+        e_short  = (not hp) and dn_ and rising and (not dn_p)
+        e_long_s = (not hp) and up_ and rising and (p[i] >= ht)
+        e_shrt_s = (not hp) and dn_ and rising and (m[i] >  ht)
 
-        # شرط‌های عمومی خروج (جهت‌دار نیستند)
-        exit_long_cond  = (cross and dup_p) or (hp and not hp_prev)
-        exit_short_cond = (cross and ddn_p) or (hp and not hp_prev)
+        x_long  = (cross and up_p) or (hp and not hp_p)
+        x_short = (cross and dn_p) or (hp and not hp_p)
 
         prev = cond[i-1]
+        x_l_now = (prev > 0) and x_long
+        x_s_now = (prev < 0) and x_short
 
-        # ✅ فقط اگر واقعاً در پوزیشن هم‌جهت باشیم، خروج معتبر است
-        exit_long_now  = (prev > 0) and exit_long_cond
-        exit_short_now = (prev < 0) and exit_short_cond
+        if x_l_now:   ex[i] =  1
+        elif x_s_now: ex[i] = -1
 
-        if exit_long_now:
-            exit_sig[i] = 1
-        elif exit_short_now:
-            exit_sig[i] = -1
+        if   prev !=  1   and e_long_s:   cond[i] =  1
+        elif prev != -1   and e_shrt_s:   cond[i] = -1
+        elif prev !=  0.5 and e_long:     cond[i] =  0.5
+        elif prev != -0.5 and e_short:    cond[i] = -0.5
+        elif x_l_now or x_s_now:          cond[i] =  0
+        else:                             cond[i] = prev
 
-        # --- ماشین حالت ---
-        if   prev !=  1   and entry_long_str:   cond[i] =  1
-        elif prev != -1   and entry_short_st:   cond[i] = -1
-        elif prev !=  0.5 and entry_long:       cond[i] =  0.5
-        elif prev != -0.5 and entry_short:      cond[i] = -0.5
-        elif exit_long_now:                     cond[i] =  0
-        elif exit_short_now:                    cond[i] =  0
-        else:                                   cond[i] = prev
+    return (pd.Series(cond, index=adx.index),
+            pd.Series(ex, index=adx.index))
 
-    return pd.Series(cond, index=adx.index), pd.Series(exit_sig, index=adx.index)
+def lbl(v):
+    return {1.0:"Long قوی", 0.5:"Long ضعیف", 0.0:"خنثی",
+            -0.5:"Short ضعیف", -1.0:"Short قوی"}.get(float(v),"?")
 
-def state_label(v):
-    return {
-         1.0: "Long قوی",
-         0.5: "Long ضعیف",
-         0.0: "خنثی",
-        -0.5: "Short ضعیف",
-        -1.0: "Short قوی",
-    }.get(float(v), "?")
-
-def send_telegram_message(text):
-    token = os.environ.get('TELEGRAM_BOT_TOKEN')
-    chat_id = os.environ.get('TELEGRAM_CHAT_ID')
-    if not token or not chat_id:
-        print("❌ توکن یا chat_id تنظیم نشده است.")
-        return
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    payload = {'chat_id': chat_id, 'text': text, 'parse_mode': 'HTML'}
+def tg(text):
+    tok = os.environ.get('TELEGRAM_BOT_TOKEN')
+    cid = os.environ.get('TELEGRAM_CHAT_ID')
+    if not tok or not cid:
+        print("❌ TELEGRAM env vars not set"); return
     try:
-        r = requests.post(url, data=payload, timeout=10)
-        if r.status_code != 200:
-            print(f"⚠️ خطا در ارسال پیام: {r.text}")
-        else:
-            print("✅ پیام با موفقیت به تلگرام ارسال شد.")
+        r = requests.post(f"https://api.telegram.org/bot{tok}/sendMessage",
+                          data={'chat_id':cid,'text':text,'parse_mode':'HTML'},
+                          timeout=10)
+        print("✅ ارسال شد" if r.status_code==200 else f"⚠️ {r.text}")
     except Exception as e:
-        print(f"❌ خطا در ارسال به تلگرام: {e}")
+        print(f"❌ {e}")
 
-# ---------- اجرای اصلی ----------
-print(f"🔍 استخراج کندل مرجع {PATTERN_SYMBOL} در تاریخ {PATTERN_DATE} (روزانه) ...")
-ref_daily = get_daily_data(PATTERN_SYMBOL, start='2024-01-01')
-if ref_daily is None:
-    print(f"❌ خطا در دریافت داده‌های {PATTERN_SYMBOL}")
-    exit()
+# ---------- main ----------
+print(f"🔍 کندل مرجع {PATTERN_SYMBOL} @ {PATTERN_DATE}")
+ref = get_ref()
+if ref is None: exit("❌ no ref")
+mask = ref.index.date == pd.to_datetime(PATTERN_DATE).date()
+if not mask.any(): exit(f"❌ کندل {PATTERN_DATE} موجود نیست")
+cdl = ref[mask].iloc[0]
+o,h,l,c = cdl['open'], cdl['high'], cdl['low'], cdl['close']
+pv = vec(o,h,l,c)
+if pv is None: exit("❌ invalid candle")
+print(f"📌 الگو: O={o:.4f} H={h:.4f} L={l:.4f} C={c:.4f}")
 
-target_date = pd.to_datetime(PATTERN_DATE).date()
-mask = ref_daily.index.date == target_date
-if not mask.any():
-    print(f"❌ کندلی برای تاریخ {PATTERN_DATE} یافت نشد.")
-    print(f"📅 آخرین تاریخ موجود در داده: {ref_daily.index[-1].date()}")
-    print(f"📅 اولین تاریخ موجود در داده: {ref_daily.index[0].date()}")
-    exit()
-
-candle = ref_daily[mask].iloc[0]
-o, h, l, c = candle['open'], candle['high'], candle['low'], candle['close']
-pattern_vec = candle_vector(o, h, l, c)
-if pattern_vec is None:
-    print("❌ کندل مرجع نامعتبر است.")
-    exit()
-
-print(f"📌 کندل مرجع (روزانه): O={o:.4f}  H={h:.4f}  L={l:.4f}  C={c:.4f}")
-print(f"📐 بردار الگو: O={pattern_vec[0]:.3f} | H={pattern_vec[1]:.3f} | "
-      f"L={pattern_vec[2]:.3f} | C={pattern_vec[3]:.3f}")
-
-print("\n📊 دریافت نمادهای فیوچرز LBank ...")
-symbols = get_lbank_futures_symbols()
-if not symbols:
-    print("❌ هیچ نمادی برای اسکن وجود ندارد!")
-    exit()
+print("\n📊 اتصال به LBank ...")
+ex = init_lbank()
+smap = build_symbol_map(ex)
+print(f"✅ نمادها: {len(smap)}")
 
 results = []
-skipped_no_end_trend = 0
+skip_nt = 0
+skip_nd = 0
 
-for sym in tqdm(symbols, desc="اسکن ۴ ساعته + End Trend (همان کندل -۲)"):
+for base in tqdm(sorted(smap.keys()), desc="اسکن 4h (LBank)"):
     try:
-        df_4h = get_4h_data(f"{sym}-USD")
-        if df_4h is None or len(df_4h) < 40:
-            continue
+        df = fetch_4h(ex, smap[base])
+        if df is None or len(df) < 60:
+            skip_nd += 1; continue
 
-        # --- محاسبه ADX / DI / condition + exit_sig ---
-        adx, di_plus, di_minus = compute_adx_di(df_4h)
-        if adx.isna().all() or len(adx) < 40:
-            continue
-        cond, exit_sig = compute_condition_state(adx, di_plus, di_minus)
+        adx, pdi, mdi = adx_di(df)
+        if adx.isna().all():
+            skip_nd += 1; continue
 
-        # ============================================================
-        # ✅ End Trend واقعی روی همان کندل -۲
-        #    exit_sig فقط وقتی != 0 می‌شود که پوزیشن فعالی بسته شود
-        # ============================================================
-        exit_now  = int(exit_sig.iloc[-2])   # 1=خروج از Long, -1=خروج از Short, 0=ندارد
-        end_trend = (exit_now != 0)
+        cond, exs = state_machine(adx, pdi, mdi)
 
-        if FILTER_END_TREND and not end_trend:
-            skipped_no_end_trend += 1
-            continue
+        df_closed = drop_forming(df)
+        if len(df_closed) < 60:
+            skip_nd += 1; continue
+        si = len(df_closed) - 1   # آخرین کندل بسته‌شده
 
-        # --- شباهت کندلی روی همان کندل -۲ ---
-        prev = df_4h.iloc[-2]
-        vec = candle_vector(prev['open'], prev['high'],
-                            prev['low'],  prev['close'])
-        if vec is None:
-            continue
+        ex_v = int(exs.iloc[si])
+        if FILTER_END_TREND and ex_v == 0:
+            skip_nt += 1; continue
 
-        dist = float(np.linalg.norm(pattern_vec - vec))
-
-        # وضعیت قبل از خروج (کندل -۳) برای نمایش شفاف
-        state_before = float(cond.iloc[-3]) if len(cond) >= 3 else 0.0
-        state_after  = float(cond.iloc[-2])
+        row = df.iloc[si]
+        v = vec(row['open'], row['high'], row['low'], row['close'])
+        if v is None: continue
+        d = float(np.linalg.norm(pv - v))
 
         results.append({
-            'symbol':     sym,
-            'dist':       dist,
-            'last_4h':    df_4h.index[-2].strftime('%Y-%m-%d %H:%M'),
-            'o': float(prev['open']),
-            'h': float(prev['high']),
-            'l': float(prev['low']),
-            'c': float(prev['close']),
-            'adx':     float(adx.iloc[-2]),
-            'di_plus': float(di_plus.iloc[-2]),
-            'di_minus':float(di_minus.iloc[-2]),
-            'state_before': state_before,
-            'state_after':  state_after,
-            'exit_type': exit_now,
-            'end_trend': end_trend,
+            'sym': base, 'dist': d,
+            'ts': df.index[si].strftime('%Y-%m-%d %H:%M UTC'),
+            'o':float(row['open']), 'h':float(row['high']),
+            'l':float(row['low']),  'c':float(row['close']),
+            'adx':   float(adx.iloc[si]),
+            'adx_p': float(adx.iloc[si-1]) if si >= 1 else float('nan'),
+            'pdi':   float(pdi.iloc[si]),
+            'mdi':   float(mdi.iloc[si]),
+            'st_b':  float(cond.iloc[si-1]) if si >= 1 else 0.0,
+            'st_a':  float(cond.iloc[si]),
+            'ex':    ex_v,
         })
+
+        if base == DEMO_DEBUG_SYM:
+            print(f"\n[DEBUG {base}] کندل‌های اخیر (LBank):")
+            for i in range(max(0, si-4), si+1):
+                mark = " ←سیگنال" if i == si else ""
+                print(f"  {df.index[i]} | ADX={adx.iloc[i]:.3f} "
+                      f"+DI={pdi.iloc[i]:.2f} -DI={mdi.iloc[i]:.2f} "
+                      f"state={cond.iloc[i]:+.1f} exit={int(exs.iloc[i])}{mark}")
+
         time.sleep(0.3)
     except Exception:
         continue
 
-if results:
-    df_res = pd.DataFrame(results).sort_values('dist').head(SHOW_N)
+# ---------- گزارش ----------
+if not results:
+    msg = "❌ هیچ کندلی با End Trend واقعی در آخرین کندل بسته‌شده یافت نشد."
+    print("\n"+msg); tg(msg); exit()
 
-    lines = []
-    lines.append(f"🏆 <b>کندل‌های ۴ ساعته (قبلی) مشابه کندل روزانه {PATTERN_SYMBOL} ({PATTERN_DATE})</b>\n")
-    lines.append(f"الگو (روزانه): O={o:.6g} | H={h:.6g} | L={l:.6g} | C={c:.6g}")
-    if FILTER_END_TREND:
-        lines.append("🔎 <i>فقط کندل‌هایی که End Trend واقعی در همان کندل -۲ رخ داده</i>\n")
-    else:
-        lines.append("🔎 <i>بدون فیلتر End Trend</i>\n")
+df_r = pd.DataFrame(results).sort_values('dist').head(SHOW_N)
 
-    for _, row in df_res.iterrows():
-        exit_label = {
-             1: "🟢 End Trend: خروج از Long",
-            -1: "🔴 End Trend: خروج از Short",
-             0: "—"
-        }.get(int(row['exit_type']), "—")
+lines = [f"🏆 <b>مشابه الگوی {PATTERN_SYMBOL} ({PATTERN_DATE})</b>\n",
+         f"الگو: O={o:.6g} H={h:.6g} L={l:.6g} C={c:.6g}",
+         "🔎 <i>داده مستقیم از LBank | سیگنال روی آخرین کندل بسته‌شده 4h (UTC)</i>\n"]
 
-        lines.append(
-            f"🔸 <b>{row['symbol']}</b>  (فاصله: {row['dist']:.4f})\n"
-            f"   زمان ۴h: {row['last_4h']} | "
-            f"O={row['o']:.6g} H={row['h']:.6g} "
-            f"L={row['l']:.6g} C={row['c']:.6g}\n"
-            f"   ADX={row['adx']:.2f} | +DI={row['di_plus']:.2f} | "
-            f"−DI={row['di_minus']:.2f}\n"
-            f"   وضعیت قبلی: {state_label(row['state_before'])} → "
-            f"وضعیت بعدی: {state_label(row['state_after'])}\n"
-            f"   {exit_label}"
-        )
-
-    lines.append(f"\n📅 تعداد ارزهای اسکن‌شده: {len(symbols)}")
-    if FILTER_END_TREND:
-        lines.append(f"🚫 رد شده به دلیل نداشتن End Trend واقعی: {skipped_no_end_trend}")
-    lines.append(f"✅ نتایج یافت‌شده: {len(df_res)}")
-
-    message = "\n".join(lines)
-    send_telegram_message(message)
-    print("\n" + message)
-else:
-    print("\n❌ نتیجه‌ای یافت نشد.")
-    send_telegram_message(
-        "❌ در اسکن امروز هیچ کندلی با End Trend واقعی در کندل -۲ پیدا نشد."
-        if FILTER_END_TREND else
-        "❌ در اسکن امروز هیچ نتیجه‌ای یافت نشد."
+for _, r in df_r.iterrows():
+    ex_lbl = {1:"🟢 خروج از Long", -1:"🔴 خروج از Short"}.get(int(r['ex']),"")
+    adx_p_s = f"{r['adx_p']:.2f}" if pd.notna(r['adx_p']) else "—"
+    warn = " ⚠️ مرزی" if 19.5 <= r['adx'] <= 20.5 else ""
+    lines.append(
+        f"🔸 <b>{r['sym']}</b> (فاصله: {r['dist']:.4f})\n"
+        f"   کندل: {r['ts']}\n"
+        f"   O={r['o']:.6g} H={r['h']:.6g} L={r['l']:.6g} C={r['c']:.6g}\n"
+        f"   ADX={r['adx']:.3f}{warn} (قبلی: {adx_p_s}) | "
+        f"+DI={r['pdi']:.2f} | -DI={r['mdi']:.2f}\n"
+        f"   {lbl(r['st_b'])} → {lbl(r['st_a'])} | {ex_lbl}"
     )
 
-print("\n✅ اسکن کامل شد!")
+lines.append(f"\n📊 اسکن: {len(smap)} | بدون داده: {skip_nd} | "
+             f"بدون End Trend: {skip_nt} | نتایج: {len(df_r)}")
+
+msg = "\n".join(lines)
+print("\n"+msg); tg(msg)
+print("\n✅ Done")
