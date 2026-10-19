@@ -1,42 +1,40 @@
-name: LBank ADX-MACD scanner
+name: Manual Crypto Backtest
 
 on:
-  workflow_dispatch:        # فقط اجرای دستی از Actions ← Run workflow
-
-permissions:
-  contents: read
+  workflow_dispatch:  # فقط اجرای دستی
 
 jobs:
-  scan:
+  run-backtest:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 120
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
-          cache: pip
+          python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas numpy requests
 
-      - name: Run scanner
-        run: python scanner.py
+      - name: Create results directory
+        run: mkdir -p results
+
+      - name: Run backtest
+        run: python backtest.py
         env:
+          RANGE_DAYS: 700
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
 
-          # کراس MACD صعودی: در ۱ تا ۳ کندل اخیر (آخرین کندل کامل = #1)
-          MACD_LOOKBACK: "3"
-
-          # مثلث قرمز ADX (shortE): در ۱ تا ۲۰ کندل اخیر
-          # بدون قید ترتیب نسبت به کراس — می‌تواند قبل، بعد یا هم‌زمان باشد
-          LOOKBACK: "20"
-
-          # ارسال خلاصه آماری حتی وقتی هیچ سیگنالی پیدا نشد (0 = خاموش)
-          NOTIFY_EMPTY: "1"
-
-          # تعداد روزهای داده ۱ساعته دریافتی از Yahoo
-          RANGE_DAYS: "60"
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: backtest-results
+          path: results/
